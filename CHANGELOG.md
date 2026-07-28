@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.0](https://github.com/niklasfrick/spark-dashboard/compare/spark-dashboard-v0.13.0...spark-dashboard-v0.14.0) (2026-07-28)
+
+
+### Features
+
+* **deploy:** grant the state directory in the systemd unit ([9931ce8](https://github.com/niklasfrick/spark-dashboard/commit/9931ce865c54bcff24296cad25c688cc0ccff173))
+* **docker:** persist the dashboard configuration in a named volume ([0b625c7](https://github.com/niklasfrick/spark-dashboard/commit/0b625c7ddb4c050b3c1588fd05cab01f1efa0129))
+* **frontend:** configuration load/save client and failure banners ([ed36d9c](https://github.com/niklasfrick/spark-dashboard/commit/ed36d9c571ae8824c7043796217bcfaa939aeeb4)), closes [#77](https://github.com/niklasfrick/spark-dashboard/issues/77)
+* **frontend:** dashboard document schema, migrations and default preset ([0f4ae34](https://github.com/niklasfrick/spark-dashboard/commit/0f4ae34be5fc9e9f325b544fa9be0065c0108127)), closes [#76](https://github.com/niklasfrick/spark-dashboard/issues/76)
+* **frontend:** dashboard grid geometry and panel type vocabulary ([328941a](https://github.com/niklasfrick/spark-dashboard/commit/328941a037c894a9e2c7851f42b420a98b1b4999)), closes [#76](https://github.com/niklasfrick/spark-dashboard/issues/76)
+* **frontend:** recognize BAAI and Baidu provider icons ([f3b3439](https://github.com/niklasfrick/spark-dashboard/commit/f3b34395e6e5ee73d12b9c3c0f66276e1d373401))
+* **frontend:** resolve panel bindings without silent substitution ([5195e2e](https://github.com/niklasfrick/spark-dashboard/commit/5195e2e06b750bdaf164ee5af8f761d8e1208d31)), closes [#76](https://github.com/niklasfrick/spark-dashboard/issues/76)
+* **server:** store the dashboard configuration in a state directory ([8546a57](https://github.com/niklasfrick/spark-dashboard/commit/8546a5791b250990f1927fbe099e3dfab5b01264)), closes [#72](https://github.com/niklasfrick/spark-dashboard/issues/72)
+
 ## [0.13.0](https://github.com/niklasfrick/spark-dashboard/compare/spark-dashboard-v0.12.0...spark-dashboard-v0.13.0) (2026-07-27)
 
 
