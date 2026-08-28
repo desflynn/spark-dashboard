@@ -60,7 +60,7 @@ export const ArcGauge = React.memo(function ArcGauge({
         .reduce((sum, s) => sum + s.value, 0)
       return Math.round((used / total) * 100)
     }
-    return 0
+    return '—'
   })()
 
   const segmentsToRender = segments?.filter(s => s.value > 0 && s.total > 0) ?? []
@@ -121,7 +121,8 @@ export const ArcGauge = React.memo(function ArcGauge({
         ) : (
           /* Single-value arc (no segments) */
           (() => {
-            const v = value ?? 0
+            if (value === undefined) return null
+            const v = value
             const percent = Math.min(Math.max(v / max, 0), 1)
             const offset = arc - percent * arc
             const color = thresholds

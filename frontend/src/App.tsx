@@ -38,7 +38,7 @@ function chipLabel(engine: EngineSnapshot): string {
 
 /** Left-hand subline under the SPARK wordmark. */
 function sublineLabel(engines: EngineSnapshot[], activeTab: string): string {
-  if (activeTab === 'all') return `FLEET · ${engines.length} MODELS ON ONE BOX`
+  if (activeTab === 'all') return `FLEET · ${engines.length} ENGINES ON ONE BOX`
   const engine = findEngineByKey(engines, activeTab)
   return engine ? chipLabel(engine) : activeTab
 }
@@ -101,7 +101,7 @@ function App() {
     [getRequests],
   )
 
-  const liveConnected = connectionStatus === 'connected'
+  const liveConnected = connectionStatus === 'connected' && !isStale
 
   return (
     <div className="h-dvh flex flex-col bg-[#08080a] overflow-hidden">

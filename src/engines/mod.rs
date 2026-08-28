@@ -7,7 +7,7 @@ pub mod warmup;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
@@ -95,9 +95,11 @@ pub struct HistogramBucket {
 #[derive(Clone, Debug, serde::Serialize, Default)]
 pub struct EngineMetrics {
     pub tokens_per_sec: Option<f64>,
+    pub tokens_per_sec_interval_ms: Option<u64>,
     pub avg_tokens_per_sec: Option<f64>,
     pub per_request_tps: Option<f64>,
     pub ttft_ms: Option<f64>,
+    pub ttft_observations: Option<u64>,
     pub active_requests: Option<u64>,
     pub queued_requests: Option<u64>,
     pub kv_cache_percent: Option<f64>,
@@ -106,8 +108,10 @@ pub struct EngineMetrics {
     // --- New metrics ---
     /// Average end-to-end request latency in milliseconds.
     pub e2e_latency_ms: Option<f64>,
+    pub e2e_observations: Option<u64>,
     /// Prompt (prefill) token throughput (tokens/sec), computed as rate from counter.
     pub prompt_tokens_per_sec: Option<f64>,
+    pub prompt_tokens_per_sec_interval_ms: Option<u64>,
     /// Running average of prompt (prefill) token throughput (tokens/sec).
     pub avg_prompt_tokens_per_sec: Option<f64>,
     /// Per-request average prompt throughput: prompt_tokens / prefill_time (tokens/sec).
@@ -121,6 +125,7 @@ pub struct EngineMetrics {
     /// Average inter-token latency during decode in milliseconds
     /// (gap between successive generated tokens).
     pub inter_token_latency_ms: Option<f64>,
+    pub itl_observations: Option<u64>,
     /// Cumulative count of scheduling preemptions.
     pub preemptions_total: Option<u64>,
     /// Cumulative prompt (prefill) tokens processed since engine start.
@@ -156,6 +161,7 @@ pub struct EngineMetrics {
     /// Average time per output token during decode in milliseconds — the
     /// gap between generating each subsequent token, excluding TTFT.
     pub tpot_ms: Option<f64>,
+    pub tpot_observations: Option<u64>,
     /// Tail latency percentiles for time per output token (ms).
     pub tpot_percentiles: Option<LatencyPercentiles>,
     /// Goodput: percentage (0-100) of TPOT observations meeting `TPOT_SLO_MS`.
@@ -205,6 +211,8 @@ pub struct EngineSnapshot {
     pub status: EngineStatus,
     pub model: Option<ModelInfo>,
     pub metrics: Option<EngineMetrics>,
+    /// Wall-clock timestamp of the latest successful metrics scrape.
+    pub sampled_at_ms: Option<u64>,
     pub recent_requests: Vec<RecentRequest>,
     pub deployment_mode: DeploymentMode,
     /// Indexes of the GPU(s) this engine was observed running on, derived by
@@ -591,6 +599,12 @@ pub async fn engine_collector_loop(
                         } else {
                             None
                         };
+                        let sampled_at_ms = metrics.as_ref().map(|_| {
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64
+                        });
 
                         snapshots.push(EngineSnapshot {
                             engine_type: state.adapter.engine_type(),
@@ -598,6 +612,7 @@ pub async fn engine_collector_loop(
                             status,
                             model,
                             metrics,
+                            sampled_at_ms,
                             recent_requests: Vec::new(),
                             deployment_mode: state.deployment_mode.clone(),
                             gpu_indexes: Vec::new(),

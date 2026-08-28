@@ -32,6 +32,7 @@ function engine(endpoint: string): EngineSnapshot {
     status: { type: 'Running' },
     model: null,
     metrics: null,
+    sampled_at_ms: null,
     recent_requests: [],
     deployment_mode: 'Docker',
   }

@@ -61,14 +61,16 @@ export function LogViewer({ engines = [], selectedEndpoint = null, onExpandChang
     return engines.find((e) => e.deployment_mode === 'Docker')?.endpoint ?? null
   }, [engines, selectedEndpoint])
 
-  // Scope shown in the header: the selected engine's model when a tab is bound,
-  // otherwise 'both engines' (the Global tab streams both containers).
+  // Scope shown in the header must name the container the socket actually uses.
   const selectedEngine = selectedEndpoint
     ? findEngineByEndpoint(engines, selectedEndpoint)
     : undefined
-  const scopeLabel = selectedEngine
-    ? (selectedEngine.model?.name ?? selectedEngine.endpoint)
-    : 'both engines'
+  const streamedEngine = selectedEngine ?? (
+    targetEndpoint ? findEngineByEndpoint(engines, targetEndpoint) : undefined
+  )
+  const scopeLabel = streamedEngine
+    ? (streamedEngine.model?.name ?? streamedEngine.endpoint)
+    : 'no engine'
 
   // Live rate stats on the header; empty when the caller did not send them.
   const diskStat = disk

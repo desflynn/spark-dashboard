@@ -105,6 +105,17 @@ pub struct VllmAdapter {
     last_hf_error: Mutex<Option<Instant>>,
 }
 
+fn counter_rate(current: f64, previous: f64, elapsed: Duration) -> (Option<f64>, Option<u64>) {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 || current < previous {
+        return (None, None);
+    }
+    (
+        Some((current - previous) / seconds),
+        Some(elapsed.as_millis() as u64),
+    )
+}
+
 impl VllmAdapter {
     pub fn new(
         client: reqwest::Client,
@@ -512,46 +523,38 @@ impl EngineAdapter for VllmAdapter {
 
         // TPS from generation_tokens_total counter (rate = delta / elapsed)
         let current_gen = parsed.counters.get("vllm_generation_tokens_total").copied();
+        let total_gen = raw.counters.get("vllm_generation_tokens_total").copied();
         let now = Instant::now();
 
-        let tokens_per_sec = {
+        let (tokens_per_sec, tokens_per_sec_interval_ms) = {
             let mut prev_lock = self.prev_gen_tokens.lock().await;
-            let tps = match (current_gen, prev_lock.as_ref()) {
+            let rate = match (current_gen, prev_lock.as_ref()) {
                 (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
+                    counter_rate(current, prev_val, now.duration_since(prev_time))
                 }
-                _ => None,
+                _ => (None, None),
             };
             if let Some(val) = current_gen {
                 *prev_lock = Some((val, now));
             }
-            tps
+            rate
         };
 
         // Prompt tokens/sec from prompt_tokens_total counter (rate = delta / elapsed)
         let current_prompt = parsed.counters.get("vllm_prompt_tokens_total").copied();
-        let prompt_tokens_per_sec = {
+        let total_prompt = raw.counters.get("vllm_prompt_tokens_total").copied();
+        let (prompt_tokens_per_sec, prompt_tokens_per_sec_interval_ms) = {
             let mut prev_lock = self.prev_prompt_tokens.lock().await;
-            let tps = match (current_prompt, prev_lock.as_ref()) {
+            let rate = match (current_prompt, prev_lock.as_ref()) {
                 (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
+                    counter_rate(current, prev_val, now.duration_since(prev_time))
                 }
-                _ => None,
+                _ => (None, None),
             };
             if let Some(val) = current_prompt {
                 *prev_lock = Some((val, now));
             }
-            tps
+            rate
         };
 
         // Avg TPS = sum of non-zero TPS readings / count of readings.
@@ -623,8 +626,8 @@ impl EngineAdapter for VllmAdapter {
         // Guard against queries == 0 so the tile stays blank until the engine
         // has served at least one prompt.
         let prefix_cache_hit_rate = {
-            let hits = parsed.counters.get("vllm_prefix_cache_hits_total");
-            let queries = parsed.counters.get("vllm_prefix_cache_queries_total");
+            let hits = raw.counters.get("vllm_prefix_cache_hits_total");
+            let queries = raw.counters.get("vllm_prefix_cache_queries_total");
             match (hits, queries) {
                 (Some(&h), Some(&q)) if q > 0.0 => Some((h / q) * 100.0),
                 _ => None,
@@ -634,7 +637,7 @@ impl EngineAdapter for VllmAdapter {
         // Cumulative prefix-cache queries — pass-through lifetime counter, the
         // volume the hit rate is derived from. Mirrors total_*_tokens: shown
         // raw and ungated by warmup so it stays continuous.
-        let prefix_cache_queries_total = parsed
+        let prefix_cache_queries_total = raw
             .counters
             .get("vllm_prefix_cache_queries_total")
             .map(|&q| q as u64);
@@ -838,6 +841,17 @@ impl EngineAdapter for VllmAdapter {
         let tpot_percentiles = tpot_hist.and_then(percentiles_ms);
         let tpot_goodput_pct = tpot_hist.and_then(|m| goodput_pct(m, TPOT_SLO_MS));
         let tpot_buckets = tpot_hist.and_then(buckets_for);
+        let observations = |metric: &str| -> Option<u64> {
+            parsed
+                .histograms
+                .get(metric)
+                .and_then(|buckets| buckets.last())
+                .map(|(_, count)| *count as u64)
+        };
+        let ttft_observations = observations("vllm_time_to_first_token_seconds");
+        let itl_observations = observations("vllm_inter_token_latency_seconds");
+        let e2e_observations = observations("vllm_e2e_request_latency_seconds");
+        let tpot_observations = tpot_hist.and_then(observations);
 
         // While warming, histogram-derived metrics still compute from raw
         // pass-through counters/buckets (the tracker doesn't yet have a
@@ -848,16 +862,28 @@ impl EngineAdapter for VllmAdapter {
         let blank = warming_up;
         Some(EngineMetrics {
             tokens_per_sec: if blank { None } else { tokens_per_sec },
+            tokens_per_sec_interval_ms: if blank {
+                None
+            } else {
+                tokens_per_sec_interval_ms
+            },
             avg_tokens_per_sec: if blank { None } else { avg_tokens_per_sec },
             per_request_tps: if blank { None } else { per_request_tps },
             ttft_ms: if blank { None } else { ttft_ms },
+            ttft_observations: if blank { None } else { ttft_observations },
             active_requests,
             queued_requests,
             kv_cache_percent,
             kv_cache_is_estimated: false,
             total_requests,
             e2e_latency_ms: if blank { None } else { e2e_latency_ms },
+            e2e_observations: if blank { None } else { e2e_observations },
             prompt_tokens_per_sec: if blank { None } else { prompt_tokens_per_sec },
+            prompt_tokens_per_sec_interval_ms: if blank {
+                None
+            } else {
+                prompt_tokens_per_sec_interval_ms
+            },
             avg_prompt_tokens_per_sec: if blank {
                 None
             } else {
@@ -868,9 +894,10 @@ impl EngineAdapter for VllmAdapter {
             prefix_cache_hit_rate,
             queue_time_ms: if blank { None } else { queue_time_ms },
             inter_token_latency_ms: if blank { None } else { inter_token_latency_ms },
+            itl_observations: if blank { None } else { itl_observations },
             preemptions_total,
-            total_prompt_tokens: current_prompt.map(|v| v as u64),
-            total_generation_tokens: current_gen.map(|v| v as u64),
+            total_prompt_tokens: total_prompt.map(|v| v as u64),
+            total_generation_tokens: total_gen.map(|v| v as u64),
             prefix_cache_queries_total,
             avg_batch_size: if blank { None } else { avg_batch_size },
             ttft_percentiles: if blank { None } else { ttft_percentiles },
@@ -883,6 +910,7 @@ impl EngineAdapter for VllmAdapter {
             itl_buckets: if blank { None } else { itl_buckets },
             e2e_buckets: if blank { None } else { e2e_buckets },
             tpot_ms: if blank { None } else { tpot_ms },
+            tpot_observations: if blank { None } else { tpot_observations },
             tpot_percentiles: if blank { None } else { tpot_percentiles },
             tpot_goodput_pct: if blank { None } else { tpot_goodput_pct },
             tpot_buckets: if blank { None } else { tpot_buckets },
@@ -932,6 +960,19 @@ fn spec_mean_acceptance_length(accepted: Option<f64>, drafts: Option<f64>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_rate_uses_elapsed_time_and_rejects_counter_resets() {
+        assert_eq!(
+            counter_rate(100.0, 90.0, Duration::from_secs(2)),
+            (Some(5.0), Some(2000))
+        );
+        assert_eq!(
+            counter_rate(5.0, 90.0, Duration::from_secs(1)),
+            (None, None)
+        );
+        assert_eq!(counter_rate(100.0, 90.0, Duration::ZERO), (None, None));
+    }
 
     /// HF enrichment misses for non-public model ids (401/403/404) are
     /// expected and must stay quiet; other non-success statuses (e.g. 5xx,

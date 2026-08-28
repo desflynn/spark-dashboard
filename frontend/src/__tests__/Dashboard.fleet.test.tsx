@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Dashboard } from '../components/views/Dashboard'
 import { engineKey } from '../lib/identity'
@@ -33,6 +33,7 @@ function makeSnapshot(gpus?: GpuMetrics[], engines: EngineSnapshot[] = []): Metr
     ...(gpus ? { gpus } : {}),
     cpu: { name: 'CPU', aggregate_percent: 25, per_core: [] },
     memory: {
+      source_available: true,
       total_bytes: 128 * GIB,
       display_total_bytes: 128 * GIB,
       used_bytes: 64 * GIB,
@@ -66,22 +67,27 @@ function makeEngine(endpoint: string, name: string): EngineSnapshot {
     },
     metrics: {
       tokens_per_sec: 24,
+      tokens_per_sec_interval_ms: 1000,
       avg_tokens_per_sec: 24,
       per_request_tps: 27,
       ttft_ms: 800,
+      ttft_observations: 412,
       active_requests: 2,
       queued_requests: 0,
       kv_cache_percent: 31,
       kv_cache_is_estimated: false,
       total_requests: 412,
       e2e_latency_ms: 4620,
+      e2e_observations: 412,
       prompt_tokens_per_sec: 41000,
+      prompt_tokens_per_sec_interval_ms: 1000,
       avg_prompt_tokens_per_sec: 41000,
       per_request_prompt_tps: 3180,
       swapped_requests: 0,
       prefix_cache_hit_rate: 64,
       queue_time_ms: 12,
       inter_token_latency_ms: 42,
+      itl_observations: 1000,
       preemptions_total: 0,
       total_prompt_tokens: 6_100_000,
       total_generation_tokens: 486_200,
@@ -94,6 +100,7 @@ function makeEngine(endpoint: string, name: string): EngineSnapshot {
       itl_goodput_pct: 78,
       e2e_goodput_pct: 71,
       tpot_ms: 17,
+      tpot_observations: 1000,
       tpot_percentiles: null,
       tpot_goodput_pct: 96,
       ttft_buckets: null,
@@ -107,6 +114,7 @@ function makeEngine(endpoint: string, name: string): EngineSnapshot {
       spec_decode_acceptance_rate_live: 58,
       spec_decode_mean_acceptance_length: 3.41,
     },
+    sampled_at_ms: 1000,
     recent_requests: [],
     deployment_mode: 'Docker',
     gpu_indexes: [],
@@ -203,6 +211,50 @@ describe('Fleet Dashboard', () => {
     expect(onActiveEngineChange).toHaveBeenCalledWith(undefined)
   })
 
+  it('excludes loading engines from fleet throughput', () => {
+    const running = makeEngine('http://localhost:8000', 'running-model')
+    const loading = makeEngine('http://localhost:8001', 'loading-model')
+    loading.status = { type: 'Loading' }
+    loading.metrics!.tokens_per_sec = 999
+
+    const history = {
+      getChartData: (metric: string) => metric.endsWith(':tps')
+        ? [{ timestamp: 1000, value: metric.includes('8001') ? 100 : 10, durationMs: 1000 }]
+        : [],
+    }
+    render(
+      <Dashboard
+        metrics={makeSnapshot([makeGpu(0)], [running, loading])}
+        history={history}
+        events={[]}
+        requests={[]}
+        activeTab="all"
+        onActiveTabChange={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('24.0 tok/s')).toBeInTheDocument()
+    expect(screen.queryByText('1k tok/s')).not.toBeInTheDocument()
+    const card = screen.getByText('Token generation').parentElement!.parentElement!.parentElement!
+    expect(within(card).getByText('10.0')).toBeInTheDocument()
+    expect(within(card).queryByText('110')).not.toBeInTheDocument()
+  })
+
+  it('shows unknown model throughput until a rate interval has been measured', () => {
+    render(
+      <Dashboard
+        metrics={makeSnapshot([makeGpu(0)], [makeEngine('http://localhost:8000', 'test-model')])}
+        history={stubHistory()}
+        events={[]}
+        requests={[]}
+        activeTab="all"
+        onActiveTabChange={vi.fn()}
+      />,
+    )
+
+    expect(within(screen.getByRole('button', { name: /test-model/ })).getAllByText('—')).toHaveLength(2)
+  })
+
   it('reads per-GPU history keys on multi-GPU hosts and plain keys on single-GPU hosts', () => {
     const gpus = [makeGpu(0), makeGpu(1)]
     const engines = [makeEngine('http://localhost:8000', 'test-model-a')]
@@ -220,5 +272,130 @@ describe('Fleet Dashboard', () => {
     )
     expect(single.calls).toContain('gpuUtil')
     expect(single.calls.filter((c) => c.startsWith('gpu:'))).toEqual([])
+  })
+
+  it('keeps missing measurements distinct from measured zero', () => {
+    const engine = makeEngine('http://localhost:8000', 'test-model-a')
+    engine.metrics = {
+      ...engine.metrics!,
+      tokens_per_sec: null,
+      prompt_tokens_per_sec: null,
+      per_request_tps: null,
+      per_request_prompt_tps: null,
+      total_prompt_tokens: null,
+      total_generation_tokens: null,
+      active_requests: null,
+      queued_requests: null,
+      total_requests: null,
+      prefix_cache_hit_rate: null,
+      prefix_cache_queries_total: null,
+      kv_cache_percent: null,
+      ttft_goodput_pct: null,
+      itl_goodput_pct: null,
+      tpot_goodput_pct: null,
+      e2e_goodput_pct: null,
+    }
+    const gpu = makeGpu(0, { temperature_celsius: null, power_watts: null })
+
+    render(
+      <Dashboard
+        metrics={makeSnapshot([gpu], [engine])}
+        history={stubHistory()}
+        events={[]}
+        requests={[]}
+        activeTab={engineKey(engine)}
+        onActiveTabChange={vi.fn()}
+      />,
+    )
+
+    const tempCell = screen.getByText('GPU temp').parentElement!
+    expect(tempCell).toHaveTextContent('—')
+    expect(tempCell).toHaveTextContent('Telemetry unavailable')
+
+    const queueCell = screen.getByText('Queue').parentElement!
+    expect(queueCell).toHaveTextContent(/—\s*waiting/)
+    expect(queueCell).toHaveTextContent(/—\s*in flight/)
+
+    const promptCard = screen.getByText('Prompt processing').closest('div.flex.flex-col')!
+    expect(promptCard).toHaveTextContent('— tok/s')
+
+    const cacheCard = screen.getByText('Cache').parentElement!.parentElement!
+    expect(cacheCard).toHaveTextContent(/Prefix hit\s*—%/)
+    expect(cacheCard).toHaveTextContent(/Prefix lookups\s*—/)
+
+    const goodput = screen.getByText('Requests meeting each target').parentElement!
+    expect(goodput).toHaveTextContent('—%')
+  })
+
+  it('shows the same available memory in the summary and memory card', () => {
+    render(
+      <Dashboard
+        metrics={makeSnapshot([makeGpu(0)])}
+        history={stubHistory()}
+        events={[]}
+        requests={[]}
+        activeTab="all"
+        onActiveTabChange={vi.fn()}
+      />,
+    )
+
+    const freeLabel = screen.getByText('GB free')
+    expect(freeLabel.parentElement?.previousElementSibling).toHaveTextContent('64.0')
+    expect(screen.getAllByText('GPU processes est.')).not.toHaveLength(0)
+    expect(screen.getAllByText('Host used est.')).not.toHaveLength(0)
+  })
+
+  it('shows unavailable memory telemetry as unknown rather than zero capacity', () => {
+    const snapshot = makeSnapshot([makeGpu(0)])
+    snapshot.memory = {
+      ...snapshot.memory,
+      source_available: false,
+      total_bytes: 0,
+      display_total_bytes: 0,
+      used_bytes: 0,
+      available_bytes: 0,
+      cached_bytes: 0,
+    }
+
+    render(
+      <Dashboard
+        metrics={snapshot}
+        history={stubHistory()}
+        events={[]}
+        requests={[]}
+        activeTab="all"
+        onActiveTabChange={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('Memory free').parentElement).toHaveTextContent('Telemetry unavailable')
+    expect(screen.getByText('Unified memory').parentElement?.parentElement).toHaveTextContent('Telemetry unavailable')
+  })
+
+  it('labels cumulative latency honestly and keeps model rows on current engine data', () => {
+    const engine = makeEngine('http://localhost:8000', 'test-model-a')
+    const key = engineKey(engine)
+    const history = {
+      getChartData: (metric: string) => metric === `${key}:ttft`
+        ? [{ timestamp: 1_000, value: 5_000 }]
+        : metric === `${key}:ttftObservations`
+          ? [{ timestamp: 1_000, value: 412 }]
+          : [],
+    }
+
+    render(
+      <Dashboard
+        metrics={makeSnapshot([makeGpu(0)], [engine])}
+        history={history}
+        events={[]}
+        requests={[]}
+        activeTab="all"
+        onActiveTabChange={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText(/lifetime average · weighted across both models/)).toBeInTheDocument()
+    expect(screen.getByText('across running engine lifetimes')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /test-model-a/ })).toHaveTextContent(/0\.8\s*s/)
   })
 })

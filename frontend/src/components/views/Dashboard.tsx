@@ -13,17 +13,21 @@ import {
   COOL,
   GOOD,
   alpha,
+  activeFleetWindowMean,
+  activeWindowMean,
   fmt,
+  fmtOptional,
   fmtSeconds,
   firstTokColor,
   gpuTempColor,
   goodputColor,
   memFreeColor,
+  memoryBreakdown,
   queueColor,
-  sumSeries,
+  sumConcurrentSeries,
   tarColor,
   wholeAnswerColor,
-  windowedMean,
+  weightedSeries,
   type DataPoint,
 } from '@/lib/fleet'
 import type { MetricsSnapshot } from '@/types/metrics'
@@ -99,6 +103,7 @@ interface ThroughputProps {
   series: DataPoint[]
   color: string
   height: number
+  nowMs: number
 }
 
 function ThroughputCard({
@@ -113,6 +118,7 @@ function ThroughputCard({
   series,
   color,
   height,
+  nowMs,
 }: ThroughputProps) {
   return (
     <div
@@ -166,7 +172,7 @@ function ThroughputCard({
       </div>
 
       <div className="relative" style={{ height, margin: '0 -6px' }}>
-        <AreaSparkline data={series} color={color} height={height} />
+        <AreaSparkline data={series} color={color} height={height} nowMs={nowMs} />
       </div>
 
       <div
@@ -197,6 +203,7 @@ interface ModelRowProps {
   series: DataPoint[]
   color: string
   onSelect: () => void
+  nowMs: number
 }
 
 function ModelRow({
@@ -212,6 +219,7 @@ function ModelRow({
   series,
   color,
   onSelect,
+  nowMs,
 }: ModelRowProps) {
   return (
     <div
@@ -279,7 +287,7 @@ function ModelRow({
         }
       />
       <div className="flex-1 min-w-0 min-h-0" style={{ height: '44px' }}>
-        <AreaSparkline data={series} color={color} height={44} />
+        <AreaSparkline data={series} color={color} height={44} nowMs={nowMs} />
       </div>
     </div>
   )
@@ -319,7 +327,7 @@ function GoodputChip({
   color,
 }: {
   label: string
-  pct: number
+  pct: number | null
   color: string
 }) {
   return (
@@ -338,7 +346,7 @@ function GoodputChip({
       />
       <span style={{ fontSize: '12px', color: '#a6aeb5' }}>{label}</span>
       <span className="font-mono tabular-nums" style={{ fontSize: '13px', fontWeight: 600, color }}>
-        {Math.round(pct)}%
+        {pct == null ? '—' : Math.round(pct)}%
       </span>
     </div>
   )
@@ -383,8 +391,8 @@ export function Dashboard({
   // history layer writes; single-GPU hosts use the plain metric keys.
   const gpuMetricKey = (m: string) => (multiGpu ? `gpu:${boxGpuIndex}:${m}` : m)
 
-  const running = engines.filter((e) => e.metrics !== null)
-  const aggregate = aggregateEngines(engines)
+  const running = engines.filter((e) => e.status.type === 'Running' && e.metrics !== null)
+  const aggregate = aggregateEngines(running)
 
   const readSeries = (key: string): DataPoint[] => history.getChartData(key)
   const activeKey = !isAll && activeEngine ? engineKey(activeEngine) : ''
@@ -392,17 +400,11 @@ export function Dashboard({
 
   // ---- Throughput (PP / TG): 5-min average from history ----
   const ppMean = isAll
-    ? windowedMean(
-        sumSeries(running.map((e) => readSeries(`${engineKey(e)}:promptTps`))),
-        nowMs,
-      )
-    : windowedMean(eng('promptTps'), nowMs)
+    ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)), nowMs)
+    : activeWindowMean(eng('promptTps'), nowMs)
   const tgMean = isAll
-    ? windowedMean(
-        sumSeries(running.map((e) => readSeries(`${engineKey(e)}:tps`))),
-        nowMs,
-      )
-    : windowedMean(eng('tps'), nowMs)
+    ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:tps`)), nowMs)
+    : activeWindowMean(eng('tps'), nowMs)
 
   // Live (instantaneous) values from the snapshot, aggregated or per-engine.
   const ppNow = isAll
@@ -423,11 +425,11 @@ export function Dashboard({
     : activeEngine?.metrics?.total_generation_tokens
 
   const ppSeries = isAll
-    ? sumSeries(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)))
-    : eng('promptTps')
+    ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)))
+    : sumConcurrentSeries([eng('promptTps')])
   const tgSeries = isAll
-    ? sumSeries(running.map((e) => readSeries(`${engineKey(e)}:tps`)))
-    : eng('tps')
+    ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:tps`)))
+    : sumConcurrentSeries([eng('tps')])
 
   const throughput = {
     pp: {
@@ -435,10 +437,10 @@ export function Dashboard({
       badgeColor: GOOD,
       title: 'Prompt processing',
       sub: 'prefill · tokens read',
-      big: fmt(ppMean ?? 0),
-      now: fmt(ppNow ?? 0),
-      perReq: fmt(ppPerReq ?? 0),
-      total: formatCompactTokens(ppTotal ?? 0),
+      big: fmtOptional(ppMean),
+      now: fmtOptional(ppNow),
+      perReq: fmtOptional(ppPerReq),
+      total: ppTotal == null ? '—' : formatCompactTokens(ppTotal),
       series: ppSeries,
       color: GOOD,
     },
@@ -447,57 +449,66 @@ export function Dashboard({
       badgeColor: COOL,
       title: 'Token generation',
       sub: 'decode · tokens written',
-      big: fmt(tgMean ?? 0),
-      now: fmt(tgNow ?? 0),
-      perReq: fmt(tgPerReq ?? 0),
-      total: formatCompactTokens(tgTotal ?? 0),
+      big: fmtOptional(tgMean),
+      now: fmtOptional(tgNow),
+      perReq: fmtOptional(tgPerReq),
+      total: tgTotal == null ? '—' : formatCompactTokens(tgTotal),
       series: tgSeries,
       color: COOL,
     },
   }
 
   // ---- Summary row ----
+  const memoryAvailable = metrics.memory.source_available
   const availBytes = metrics.memory.available_bytes
   const displayTotalBytes = metrics.memory.display_total_bytes ?? metrics.memory.total_bytes
   const freeGB = availBytes / GIB
   const totalGB = displayTotalBytes / GIB
-  const memColor = memFreeColor(freeGB)
-  const memStatus =
-    freeGB < 8
+  const memColor = memoryAvailable ? memFreeColor(freeGB) : '#8b949d'
+  const memStatus = !memoryAvailable
+    ? 'Telemetry unavailable'
+    : freeGB < 8
       ? 'Critical — no headroom'
       : freeGB < 24
         ? `Tight — ${Math.round((freeGB / totalGB) * 100)}% headroom`
         : 'Comfortable'
 
-  const gpuTemp = boxGpu.temperature_celsius ?? 0
-  const gpuPower = boxGpu.power_watts ?? 0
+  const gpuTemp = boxGpu.temperature_celsius
+  const gpuPower = boxGpu.power_watts
+  const gpuStatus = gpuTemp == null
+    ? 'Telemetry unavailable'
+    : gpuTemp >= 85
+      ? 'Hot'
+      : gpuTemp >= 70
+        ? 'Warm'
+        : 'Nominal'
 
   const queuedSum = isAll
-    ? aggregate.queued_requests ?? 0
-    : activeEngine?.metrics?.queued_requests ?? 0
+    ? aggregate.queued_requests
+    : activeEngine?.metrics?.queued_requests
   const activeSum = isAll
-    ? aggregate.active_requests ?? 0
-    : activeEngine?.metrics?.active_requests ?? 0
+    ? aggregate.active_requests
+    : activeEngine?.metrics?.active_requests
   const servedSum = isAll
-    ? aggregate.total_requests ?? 0
-    : activeEngine?.metrics?.total_requests ?? 0
+    ? aggregate.total_requests
+    : activeEngine?.metrics?.total_requests
 
-  // ---- Latency (model tab: 5-min averages; All: aggregate weighted means) ----
+  // ---- Latency (cumulative engine histograms since the warmup baseline) ----
   const ttftMs = isAll
-    ? aggregate.ttft_ms ?? 0
-    : windowedMean(eng('ttft'), nowMs) ?? 0
+    ? aggregate.ttft_ms
+    : activeEngine?.metrics?.ttft_ms
   const e2eMs = isAll
-    ? aggregate.e2e_latency_ms ?? 0
-    : windowedMean(eng('e2eLatency'), nowMs) ?? 0
+    ? aggregate.e2e_latency_ms
+    : activeEngine?.metrics?.e2e_latency_ms
   const itlMs = isAll
-    ? aggregate.inter_token_latency_ms ?? 0
-    : windowedMean(eng('interTokenLatency'), nowMs) ?? 0
+    ? aggregate.inter_token_latency_ms
+    : activeEngine?.metrics?.inter_token_latency_ms
   const tpotMs = isAll
-    ? aggregate.tpot_ms ?? 0
-    : windowedMean(eng('tpot'), nowMs) ?? 0
+    ? aggregate.tpot_ms
+    : activeEngine?.metrics?.tpot_ms
   const batch = isAll
-    ? aggregate.avg_batch_size ?? 0
-    : windowedMean(eng('batchSize'), nowMs) ?? 0
+    ? aggregate.avg_batch_size
+    : activeEngine?.metrics?.avg_batch_size
 
   const goodputSources = isAll
     ? [
@@ -521,14 +532,14 @@ export function Dashboard({
 
   // ---- Cache ----
   const prefixHit = isAll
-    ? aggregate.prefix_cache_hit_rate ?? 0
-    : activeEngine?.metrics?.prefix_cache_hit_rate ?? 0
+    ? aggregate.prefix_cache_hit_rate
+    : activeEngine?.metrics?.prefix_cache_hit_rate
   const kvCache = isAll
-    ? aggregate.kv_cache_percent ?? 0
-    : activeEngine?.metrics?.kv_cache_percent ?? 0
+    ? aggregate.kv_cache_percent
+    : activeEngine?.metrics?.kv_cache_percent
   const prefixQueries = isAll
-    ? aggregate.prefix_cache_queries_total ?? 0
-    : activeEngine?.metrics?.prefix_cache_queries_total ?? 0
+    ? aggregate.prefix_cache_queries_total
+    : activeEngine?.metrics?.prefix_cache_queries_total
 
   const specTar = isAll
     ? aggregate.spec_decode_acceptance_rate
@@ -552,33 +563,32 @@ export function Dashboard({
   const hwParts = [
     boxGpu.name ?? 'GPU',
     metrics.cpu.name ?? 'CPU',
-    `${formatGiB(displayTotalBytes)} unified`,
+    memoryAvailable ? `${formatGiB(displayTotalBytes)} unified` : 'memory unavailable',
   ].filter((p) => p.length > 0)
 
   // ---- Unified memory segments ----
-  const gpuEst = metrics.memory.gpu_estimated_bytes ?? 0
-  const usedBytes = metrics.memory.used_bytes
-  const cachedBytes = metrics.memory.cached_bytes
-  const availableBytes = metrics.memory.available_bytes
-  const hostBytes = Math.max(0, usedBytes - gpuEst)
-  const cacheBytes = Math.min(cachedBytes, availableBytes)
-  // Reserved fills whatever of the marketed pool the three live segments do
-  // not, so the four segments partition display_total.
-  const reservedBytes = Math.max(0, displayTotalBytes - (gpuEst + hostBytes + cacheBytes))
-  const usedSumBytes = gpuEst + hostBytes + cacheBytes + reservedBytes
-  const clampedUsed = Math.min(displayTotalBytes, usedSumBytes)
-  const freeBytes = Math.max(0, displayTotalBytes - clampedUsed)
-  const memNote =
-    freeBytes / GIB >= 24
-      ? 'Room for another concurrent model or a longer context window.'
-      : `Both models resident (${engines
-          .map((e) => e.model?.name?.split('-')[0])
-          .filter((n) => n && n.length > 0)
-          .join(', ')}) resident. A third model or a large context burst pushes this box into swap.`
+  const {
+    gpuBytes,
+    hostBytes,
+    cacheBytes,
+    reservedBytes,
+    freeBytes,
+    inUseBytes,
+  } = memoryBreakdown({
+    displayTotalBytes,
+    kernelTotalBytes: metrics.memory.total_bytes,
+    usedBytes: metrics.memory.used_bytes,
+    availableBytes: metrics.memory.available_bytes,
+    cachedBytes: metrics.memory.cached_bytes,
+    gpuEstimatedBytes: metrics.memory.gpu_estimated_bytes,
+  })
+  const memNote = !memoryAvailable
+    ? 'Telemetry unavailable'
+    : `${fmt(freeBytes / GIB)} GB kernel-available · ${fmt(reservedBytes / GIB)} GB hardware-reserved.`
 
-  const memorySegments: BarSegment[] = [
-    { value: gpuEst, total: displayTotalBytes, color: GOOD, label: 'Weights + KV' },
-    { value: hostBytes, total: displayTotalBytes, color: COOL, label: 'Host' },
+  const memorySegments: BarSegment[] = memoryAvailable ? [
+    { value: gpuBytes, total: displayTotalBytes, color: GOOD, label: 'GPU processes est.' },
+    { value: hostBytes, total: displayTotalBytes, color: COOL, label: 'Host used est.' },
     {
       value: cacheBytes,
       total: displayTotalBytes,
@@ -586,7 +596,7 @@ export function Dashboard({
       label: 'Page cache',
     },
     { value: reservedBytes, total: displayTotalBytes, color: '#3a4046', label: 'Reserved' },
-  ]
+  ] : []
 
   // Per-core busiest % for the CPU card subtitle.
   const coreMax = metrics.cpu.per_core.reduce((m, c) => Math.max(m, c.usage_percent), 0)
@@ -615,10 +625,10 @@ export function Dashboard({
                 color: memColor,
               }}
             >
-              {fmt(freeGB)}
+              {memoryAvailable ? fmt(freeGB) : '—'}
             </span>
             <span style={{ fontSize: '12.5px', color: '#8b949d' }}>
-              GB of {fmtInt(totalGB)}
+              {memoryAvailable ? `GB of ${fmtInt(totalGB)}` : 'GB'}
             </span>
           </div>
           <div style={{ fontSize: '11.5px', color: memColor }}>{memStatus}</div>
@@ -632,16 +642,16 @@ export function Dashboard({
                 fontSize: 'clamp(22px, 2vw, 28px)',
                 fontWeight: 600,
                 letterSpacing: '-0.02em',
-                color: gpuTempColor(gpuTemp),
+                color: gpuTemp == null ? '#8b949d' : gpuTempColor(gpuTemp),
               }}
             >
-              {fmtInt(gpuTemp)}
+              {gpuTemp == null ? '—' : fmtInt(gpuTemp)}
             </span>
             <span style={{ fontSize: '12.5px', color: '#8b949d' }}>
-              °C · {fmtInt(gpuPower)} W
+              °C · {gpuPower == null ? '—' : fmtInt(gpuPower)} W
             </span>
           </div>
-          <div style={{ fontSize: '11.5px', color: '#8b949d' }}>Nominal, no throttle</div>
+          <div style={{ fontSize: '11.5px', color: '#8b949d' }}>{gpuStatus}</div>
         </SummaryCell>
 
         <SummaryCell label="Queue">
@@ -652,14 +662,14 @@ export function Dashboard({
                 fontSize: 'clamp(22px, 2vw, 28px)',
                 fontWeight: 600,
                 letterSpacing: '-0.02em',
-                color: queueColor(queuedSum),
+                color: queuedSum == null ? '#8b949d' : queueColor(queuedSum),
               }}
             >
-              {fmt(queuedSum)}
+              {fmtOptional(queuedSum)}
             </span>
             <span style={{ fontSize: '12.5px', color: '#8b949d' }}>waiting</span>
           </div>
-          <div style={{ fontSize: '11.5px', color: '#8b949d' }}>{fmt(activeSum)} in flight</div>
+          <div style={{ fontSize: '11.5px', color: '#8b949d' }}>{fmtOptional(activeSum)} in flight</div>
         </SummaryCell>
 
         <SummaryCell label="Served">
@@ -668,12 +678,12 @@ export function Dashboard({
               className="font-mono tabular-nums"
               style={{ fontSize: 'clamp(22px, 2vw, 28px)', fontWeight: 600, letterSpacing: '-0.02em' }}
             >
-              {fmt(servedSum)}
+              {fmtOptional(servedSum)}
             </span>
             <span style={{ fontSize: '12.5px', color: '#8b949d' }}>requests</span>
           </div>
           <div style={{ fontSize: '11.5px', color: '#8b949d' }}>
-            {isAll ? 'across both models' : 'this model, this session'}
+            {isAll ? 'across running engine lifetimes' : 'this engine lifetime'}
           </div>
         </SummaryCell>
       </div>
@@ -692,6 +702,7 @@ export function Dashboard({
           series={throughput.pp.series}
           color={throughput.pp.color}
           height={76}
+          nowMs={nowMs}
         />
         <ThroughputCard
           badge={throughput.tg.badge}
@@ -705,6 +716,7 @@ export function Dashboard({
           series={throughput.tg.series}
           color={throughput.tg.color}
           height={76}
+          nowMs={nowMs}
         />
       </div>
 
@@ -723,7 +735,7 @@ export function Dashboard({
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <span style={{ fontSize: '14px', fontWeight: 600 }}>Per model</span>
             <span style={{ fontSize: '11.5px', color: '#78828c' }}>
-              both models share one {boxGpu.name ?? 'GB'} and its {fmtInt(totalGB)} GB
+               both models share one {boxGpu.name ?? 'GB'} and its {memoryAvailable ? fmtInt(totalGB) : '—'} GB
             </span>
           </div>
           <div className="flex flex-col gap-3">
@@ -757,24 +769,25 @@ export function Dashboard({
                 engine.model?.precision,
                 engine.model?.pipeline_tag,
               ].filter((p): p is string => p != null && p.length > 0)
-              const ppMeanE = windowedMean(readSeries(`${key}:promptTps`), nowMs) ?? 0
-              const tgMeanE = windowedMean(readSeries(`${key}:tps`), nowMs) ?? 0
-              const ttftE = windowedMean(readSeries(`${key}:ttft`), nowMs) ?? 0
+              const ppMeanE = activeWindowMean(readSeries(`${key}:promptTps`), nowMs)
+              const tgMeanE = activeWindowMean(readSeries(`${key}:tps`), nowMs)
+              const ttftE = engine.metrics!.ttft_ms
               return (
                 <ModelRow
                   key={key}
                   name={engine.model?.name ?? key}
                   meta={metaParts.join(' · ')}
-                  pp={fmt(ppMeanE)}
-                  tg={fmt(tgMeanE)}
-                  ttft={fmtSeconds(ttftE)}
-                  ttftColor={firstTokColor(ttftE)}
+                  pp={fmtOptional(ppMeanE)}
+                  tg={fmtOptional(tgMeanE)}
+                  ttft={ttftE == null ? '—' : fmtSeconds(ttftE)}
+                  ttftColor={ttftE == null ? '#8b949d' : firstTokColor(ttftE)}
                   hit={fmtInt(engine.metrics!.prefix_cache_hit_rate)}
                   active={fmtInt(engine.metrics!.active_requests)}
                   queued={fmtInt(engine.metrics!.queued_requests)}
-                  series={readSeries(`${key}:tps`)}
+                  series={sumConcurrentSeries([readSeries(`${key}:tps`)])}
                   color={engine === engines[0] ? GOOD : COOL}
                   onSelect={() => onActiveTabChange(key)}
+                  nowMs={nowMs}
                 />
               )
             })}
@@ -799,7 +812,7 @@ export function Dashboard({
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <span style={{ fontSize: '14px', fontWeight: 600 }}>Latency</span>
             <span style={{ fontSize: '11.5px', color: '#78828c' }}>
-              5-min average · {isAll ? 'weighted across both models' : 'this model'}
+              lifetime average · {isAll ? 'weighted across both models' : 'this model'}
             </span>
           </div>
 
@@ -808,7 +821,7 @@ export function Dashboard({
               label="First token"
               hint="wait before anything appears"
               value={
-                <span style={{ color: firstTokColor(ttftMs) }}>
+                <span style={{ color: ttftMs == null ? '#8b949d' : firstTokColor(ttftMs) }}>
                   <span
                     className="font-mono tabular-nums"
                     style={{
@@ -818,7 +831,7 @@ export function Dashboard({
                       lineHeight: 1,
                     }}
                   >
-                    {fmtSeconds(ttftMs)}
+                    {ttftMs == null ? '—' : fmtSeconds(ttftMs)}
                   </span>
                   <span style={{ fontSize: '16px', color: '#8b949d', fontWeight: 400 }}> s</span>
                 </span>
@@ -828,7 +841,7 @@ export function Dashboard({
               label="Whole answer"
               hint="start to last token"
               value={
-                <span style={{ color: wholeAnswerColor(e2eMs) }}>
+                <span style={{ color: e2eMs == null ? '#8b949d' : wholeAnswerColor(e2eMs) }}>
                   <span
                     className="font-mono tabular-nums"
                     style={{
@@ -838,7 +851,7 @@ export function Dashboard({
                       lineHeight: 1,
                     }}
                   >
-                    {fmtSeconds(e2eMs)}
+                    {e2eMs == null ? '—' : fmtSeconds(e2eMs)}
                   </span>
                   <span style={{ fontSize: '14px', color: '#8b949d', fontWeight: 400 }}> s</span>
                 </span>
@@ -852,20 +865,20 @@ export function Dashboard({
                   className="font-mono tabular-nums"
                   style={{ fontSize: '22px', fontWeight: 500, lineHeight: 1 }}
                 >
-                  {fmtInt(itlMs)}
+                  {itlMs == null ? '—' : fmtInt(itlMs)}
                   <span style={{ fontSize: '12px', color: '#8b949d' }}> ms</span>
                 </span>
               }
             />
             <LatCol
               label="Per output token"
-              hint={`batch of ${batch.toFixed(1)} per step`}
+              hint={batch == null ? 'batch unavailable' : `batch of ${batch.toFixed(1)} per step`}
               value={
                 <span
                   className="font-mono tabular-nums"
                   style={{ fontSize: '22px', fontWeight: 500, lineHeight: 1 }}
                 >
-                  {fmtInt(tpotMs)}
+                  {tpotMs == null ? '—' : fmtInt(tpotMs)}
                   <span style={{ fontSize: '12px', color: '#8b949d' }}> ms</span>
                 </span>
               }
@@ -876,11 +889,15 @@ export function Dashboard({
             <AreaSparkline
               data={
                 isAll
-                  ? sumSeries(running.map((e) => readSeries(`${engineKey(e)}:ttft`)))
+                  ? weightedSeries(running.map((e) => ({
+                      values: readSeries(`${engineKey(e)}:ttft`),
+                      weights: readSeries(`${engineKey(e)}:ttftObservations`),
+                    })))
                   : readSeries(`${activeKey}:ttft`)
               }
-              color={ttftMs > 2000 ? '#ef4444' : GOOD}
+              color={ttftMs != null && ttftMs > 2000 ? '#ef4444' : GOOD}
               height={54}
+              nowMs={nowMs}
             />
           </div>
 
@@ -896,12 +913,13 @@ export function Dashboard({
             </div>
             <div className="flex flex-wrap gap-2">
               {sloLabels.map((label, i) => {
-                const color = goodputColor(goodputSources[i] ?? 0)
+                const pct = goodputSources[i] ?? null
+                const color = pct == null ? '#8b949d' : goodputColor(pct)
                 return (
                   <GoodputChip
                     key={label}
                     label={label}
-                    pct={goodputSources[i] ?? 0}
+                    pct={pct}
                     color={color}
                   />
                 )
@@ -939,7 +957,7 @@ export function Dashboard({
 
           <div className="flex items-center gap-[clamp(14px,1.6vw,22px)] flex-wrap">
             <div className="relative shrink-0" style={{ width: '138px', height: '138px' }}>
-              <ArcGauge value={prefixHit} label="Prefix hit" unit="%" size={138} hideCenter />
+              <ArcGauge value={prefixHit ?? undefined} label="Prefix hit" unit="%" size={138} hideCenter />
               <div
                 className="absolute inset-0 flex flex-col items-center justify-center"
                 style={{ gap: '1px' }}
@@ -948,7 +966,7 @@ export function Dashboard({
                   className="font-mono tabular-nums"
                   style={{ fontSize: '38px', fontWeight: 600, letterSpacing: '-0.03em' }}
                 >
-                  {fmtInt(prefixHit)}
+                  {prefixHit == null ? '—' : fmtInt(prefixHit)}
                   <span style={{ fontSize: '17px', color: '#8b949d' }}>%</span>
                 </span>
                 <div
@@ -972,7 +990,7 @@ export function Dashboard({
                   className="font-mono tabular-nums"
                   style={{ fontSize: '19px', fontWeight: 500, color: '#e7eaed' }}
                 >
-                  {formatCompactTokens(prefixQueries)}
+                  {prefixQueries == null ? '—' : formatCompactTokens(prefixQueries)}
                 </span>
               </div>
               <div className="flex flex-col gap-1.5">
@@ -984,13 +1002,13 @@ export function Dashboard({
                     KV cache used
                   </div>
                   <span className="font-mono tabular-nums" style={{ fontSize: '13px', fontWeight: 500 }}>
-                    {fmtInt(kvCache)}%
+                    {kvCache == null ? '—' : fmtInt(kvCache)}%
                   </span>
                 </div>
                 <div className="relative h-1 rounded overflow-hidden" style={{ background: '#20252a' }}>
                   <div
                     className="absolute inset-y-0 left-0"
-                    style={{ width: `${Math.max(1, kvCache)}%`, background: COOL, borderRadius: '2px' }}
+                    style={{ width: `${kvCache ?? 0}%`, background: COOL, borderRadius: '2px' }}
                   />
                 </div>
               </div>
@@ -1077,7 +1095,7 @@ export function Dashboard({
           <div className="flex items-center gap-[clamp(12px,1.4vw,20px)] flex-wrap">
             <div className="relative shrink-0" style={{ width: '132px', height: '132px' }}>
               <ArcGauge
-                value={boxGpu.utilization_percent ?? 0}
+                value={boxGpu.utilization_percent ?? undefined}
                 label="GPU Util"
                 unit="%"
                 size={132}
@@ -1088,13 +1106,13 @@ export function Dashboard({
                   className="font-mono tabular-nums"
                   style={{ fontSize: 'clamp(34px, 3.2vw, 42px)', fontWeight: 600, letterSpacing: '-0.03em' }}
                 >
-                  {fmtInt(boxGpu.utilization_percent ?? 0)}
+                  {boxGpu.utilization_percent == null ? '—' : fmtInt(boxGpu.utilization_percent)}
                   <span style={{ fontSize: '17px', color: '#8b949d' }}>%</span>
                 </span>
               </div>
             </div>
             <div className="flex-1 min-w-0 min-h-0" style={{ height: '88px' }}>
-              <AreaSparkline data={readSeries(gpuMetricKey('gpuUtil'))} color={GOOD} height={88} />
+              <AreaSparkline data={readSeries(gpuMetricKey('gpuUtil'))} color={GOOD} height={88} nowMs={nowMs} />
             </div>
           </div>
           <div
@@ -1105,8 +1123,8 @@ export function Dashboard({
               label="temp"
               value={
                 <>
-                  <span style={{ color: gpuTempColor(gpuTemp) }}>
-                    {fmtInt(gpuTemp)}
+                  <span style={{ color: gpuTemp == null ? '#8b949d' : gpuTempColor(gpuTemp) }}>
+                    {gpuTemp == null ? '—' : fmtInt(gpuTemp)}
                     <span style={{ fontSize: '11px', color: '#8b949d' }}> °C</span>
                   </span>
                 </>
@@ -1116,7 +1134,7 @@ export function Dashboard({
               label="power"
               value={
                 <>
-                  {fmtInt(gpuPower)}
+                  {gpuPower == null ? '—' : fmtInt(gpuPower)}
                   <span style={{ fontSize: '11px', color: '#8b949d' }}> W</span>
                 </>
               }
@@ -1171,7 +1189,7 @@ export function Dashboard({
               </div>
             </div>
             <div className="flex-1 min-w-0 min-h-0" style={{ height: '88px' }}>
-              <AreaSparkline data={readSeries('cpuAggregate')} color={COOL} height={88} />
+              <AreaSparkline data={readSeries('cpuAggregate')} color={COOL} height={88} nowMs={nowMs} />
             </div>
           </div>
           <div className="flex flex-col" style={{ gap: '8px' }}>
@@ -1200,7 +1218,7 @@ export function Dashboard({
           <div className="flex items-center justify-between gap-2">
             <span style={{ fontSize: '14px', fontWeight: 600 }}>Unified memory</span>
             <span className="font-mono shrink-0" style={{ fontSize: '11px', color: '#5b646e' }}>
-              {fmtInt(totalGB)} GB shared
+              {memoryAvailable ? fmtInt(totalGB) : '—'} GB shared
             </span>
           </div>
 
@@ -1215,12 +1233,12 @@ export function Dashboard({
                 color: memFreeColor(freeBytes / GIB),
               }}
             >
-              {fmt(freeBytes / GIB)}
+              {memoryAvailable ? fmt(freeBytes / GIB) : '—'}
             </span>
             <div className="flex flex-col gap-0.5 pb-1">
               <div style={{ fontSize: '15px', color: '#8b949d' }}>GB free</div>
               <div style={{ fontSize: '11.5px', color: '#78828c' }}>
-                {fmt(clampedUsed / GIB)} GB in use
+                {memoryAvailable ? `${fmt(inUseBytes / GIB)} GB in use` : 'Telemetry unavailable'}
               </div>
             </div>
           </div>

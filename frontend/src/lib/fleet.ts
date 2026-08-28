@@ -5,6 +5,8 @@
 export interface DataPoint {
   timestamp: number
   value: number
+  /** Elapsed time represented by this rate sample. */
+  durationMs?: number
 }
 
 /** Design-token colors. These are the exact `oklch()` values from the concept
@@ -30,6 +32,45 @@ export function fmt(n: number): string {
   if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'k'
   if (n >= 100) return Math.round(n).toString()
   return n.toFixed(1)
+}
+
+export function fmtOptional(n: number | null | undefined): string {
+  return n === null || n === undefined || !Number.isFinite(n) ? '—' : fmt(n)
+}
+
+interface MemoryBreakdownInput {
+  displayTotalBytes: number
+  kernelTotalBytes: number
+  usedBytes: number
+  availableBytes: number
+  cachedBytes: number
+  gpuEstimatedBytes: number | null
+}
+
+export interface MemoryBreakdown {
+  gpuBytes: number
+  hostBytes: number
+  cacheBytes: number
+  reservedBytes: number
+  freeBytes: number
+  inUseBytes: number
+}
+
+export function memoryBreakdown(input: MemoryBreakdownInput): MemoryBreakdown {
+  const kernelCapacity = Math.min(input.displayTotalBytes, input.kernelTotalBytes)
+  const inUseBytes = Math.max(0, Math.min(input.usedBytes, kernelCapacity))
+  const gpuBytes = Math.max(0, Math.min(input.gpuEstimatedBytes ?? 0, inUseBytes))
+  const cacheBytes = Math.max(0, Math.min(input.cachedBytes, inUseBytes - gpuBytes))
+  const hostBytes = inUseBytes - gpuBytes - cacheBytes
+
+  return {
+    gpuBytes,
+    hostBytes,
+    cacheBytes,
+    reservedBytes: Math.max(0, input.displayTotalBytes - kernelCapacity),
+    freeBytes: Math.max(0, Math.min(input.availableBytes, kernelCapacity - inUseBytes)),
+    inUseBytes,
+  }
 }
 
 /** Seconds with exactly one decimal, e.g. TTFT "4.3 s". */
@@ -59,6 +100,91 @@ export function windowedMean(
   return count === 0 ? null : sum / count
 }
 
+function representedInterval(
+  points: readonly DataPoint[],
+  index: number,
+): [number, number] | null {
+  const point = points[index]
+  const inferred = index > 0 ? point.timestamp - points[index - 1].timestamp : 0
+  const duration = point.durationMs ?? inferred
+  if (duration <= 0) return null
+  return [point.timestamp - duration, point.timestamp]
+}
+
+/** Active-time mean of a rate over the trailing five minutes. */
+export function activeWindowMean(
+  points: readonly DataPoint[],
+  nowMs: number,
+): number | null {
+  const cutoff = nowMs - FIVE_MIN_MS
+  let observedMs = 0
+  let activeMs = 0
+  let weighted = 0
+
+  for (let i = 0; i < points.length; i++) {
+    const interval = representedInterval(points, i)
+    if (!interval) continue
+    const start = Math.max(cutoff, interval[0])
+    const end = Math.min(nowMs, interval[1])
+    if (end <= start) continue
+
+    const duration = end - start
+    observedMs += duration
+    if (points[i].value > 0) {
+      activeMs += duration
+      weighted += points[i].value * duration
+    }
+  }
+
+  if (observedMs === 0) return null
+  return activeMs === 0 ? 0 : weighted / activeMs
+}
+
+/** Active-time mean after summing concurrent engine-rate intervals. */
+export function activeFleetWindowMean(
+  series: readonly (readonly DataPoint[])[],
+  nowMs: number,
+): number | null {
+  const cutoff = nowMs - FIVE_MIN_MS
+  const events: Array<[number, number]> = []
+  let observed = false
+
+  for (const points of series) {
+    for (let i = 0; i < points.length; i++) {
+      const interval = representedInterval(points, i)
+      if (!interval) continue
+      const start = Math.max(cutoff, interval[0])
+      const end = Math.min(nowMs, interval[1])
+      if (end <= start) continue
+      observed = true
+      events.push([start, points[i].value], [end, -points[i].value])
+    }
+  }
+
+  if (!observed) return null
+  events.sort((a, b) => a[0] - b[0])
+
+  let current = 0
+  let previous = events[0][0]
+  let activeMs = 0
+  let weighted = 0
+  for (let i = 0; i < events.length;) {
+    const timestamp = events[i][0]
+    const duration = timestamp - previous
+    if (current > 0 && duration > 0) {
+      activeMs += duration
+      weighted += current * duration
+    }
+    while (i < events.length && events[i][0] === timestamp) {
+      current += events[i][1]
+      i++
+    }
+    previous = timestamp
+  }
+
+  return activeMs === 0 ? 0 : weighted / activeMs
+}
+
 /**
  * Sum several time series into one, aligning by timestamp. Used to fold the
  * per-engine series of the "All" tab into a single composite series before
@@ -74,6 +200,66 @@ export function sumSeries(arrays: readonly DataPoint[][]): DataPoint[] {
   return Array.from(byTs.entries())
     .sort((a, b) => a[0] - b[0])
     .map(([timestamp, value]) => ({ timestamp, value }))
+}
+
+export function sumConcurrentSeries(
+  series: readonly (readonly DataPoint[])[],
+): DataPoint[] {
+  const events: Array<[number, number]> = []
+  for (const points of series) {
+    for (let i = 0; i < points.length; i++) {
+      const interval = representedInterval(points, i)
+      if (!interval) continue
+      events.push([interval[0], points[i].value], [interval[1], -points[i].value])
+    }
+  }
+
+  events.sort((a, b) => a[0] - b[0])
+  const result: DataPoint[] = []
+  let current = 0
+  for (let i = 0; i < events.length;) {
+    const timestamp = events[i][0]
+    while (i < events.length && events[i][0] === timestamp) {
+      current += events[i][1]
+      i++
+    }
+    result.push({ timestamp, value: current })
+  }
+  return result
+}
+
+interface WeightedSeriesInput {
+  values: readonly DataPoint[]
+  weights: readonly DataPoint[]
+}
+
+export function weightedSeries(series: readonly WeightedSeriesInput[]): DataPoint[] {
+  const samples = series.map(({ values, weights }) => {
+    const weightByTimestamp = new Map(weights.map((point) => [point.timestamp, point.value]))
+    return values.flatMap((point) => {
+      const weight = weightByTimestamp.get(point.timestamp)
+      return weight !== undefined && weight > 0 ? [{ ...point, weight }] : []
+    })
+  })
+  const timestamps = [...new Set(samples.flatMap((points) => points.map((point) => point.timestamp)))]
+    .sort((a, b) => a - b)
+  const indexes = samples.map(() => -1)
+
+  return timestamps.flatMap((timestamp) => {
+    let weighted = 0
+    let weight = 0
+    for (let i = 0; i < samples.length; i++) {
+      while (indexes[i] + 1 < samples[i].length && samples[i][indexes[i] + 1].timestamp <= timestamp) {
+        indexes[i]++
+      }
+      const point = samples[i][indexes[i]]
+      if (point) {
+        weighted += point.value * point.weight
+        weight += point.weight
+      }
+    }
+    return weight > 0 ? [{ timestamp, value: weighted / weight }] : []
+  })
 }
 
 /** First-token color scale: <= 0.5 s GOOD, <= 2 s WARN, else CRIT (input ms). */

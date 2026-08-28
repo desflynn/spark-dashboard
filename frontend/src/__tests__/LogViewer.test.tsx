@@ -12,6 +12,7 @@ const engine = (
   status: { type: 'Running' },
   model: null,
   metrics: null,
+  sampled_at_ms: null,
   recent_requests: [],
   deployment_mode: mode,
   gpu_indexes: [],
@@ -219,6 +220,7 @@ describe('LogViewer', () => {
       />,
     )
     const ws = expand()
+    expect(screen.getByText('http://localhost:8100')).toBeDefined()
     expect(ws.url).toContain(
       `/ws/logs?engine=${encodeURIComponent('http://localhost:8100')}`,
     )

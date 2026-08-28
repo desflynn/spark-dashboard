@@ -256,10 +256,12 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
   const get = (key: keyof NonNullable<EngineSnapshot['metrics']>) =>
     metrics.map((m) => (m ? (m[key] as number | null | undefined) : null))
 
-  const weights = get('total_requests')
-  const weightedBy = (key: keyof NonNullable<EngineSnapshot['metrics']>) =>
+  const weightedBy = (
+    key: keyof NonNullable<EngineSnapshot['metrics']>,
+    weightKey: keyof NonNullable<EngineSnapshot['metrics']> = 'total_requests',
+  ) =>
     weightedMeanOrNull(
-      get(key).map((value, i) => ({ value, weight: weights[i] })),
+      get(key).map((value, i) => ({ value, weight: get(weightKey)[i] })),
     )
 
   // Speculative decoding: sum the cumulative counters, then recompute TAR and
@@ -310,37 +312,42 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
     spec_decode_mean_acceptance_length: ratio(specAcceptedTokens, specDrafts),
 
     // Weighted mean
-    ttft_ms: weightedBy('ttft_ms'),
-    e2e_latency_ms: weightedBy('e2e_latency_ms'),
+    ttft_ms: weightedBy('ttft_ms', 'ttft_observations'),
+    e2e_latency_ms: weightedBy('e2e_latency_ms', 'e2e_observations'),
     queue_time_ms: weightedBy('queue_time_ms'),
-    inter_token_latency_ms: weightedBy('inter_token_latency_ms'),
-    tpot_ms: weightedBy('tpot_ms'),
+    inter_token_latency_ms: weightedBy('inter_token_latency_ms', 'itl_observations'),
+    tpot_ms: weightedBy('tpot_ms', 'tpot_observations'),
     per_request_tps: weightedBy('per_request_tps'),
     per_request_prompt_tps: weightedBy('per_request_prompt_tps'),
 
     // Simple mean
     avg_batch_size: meanOrNull(get('avg_batch_size')),
-    kv_cache_percent: meanOrNull(get('kv_cache_percent')),
-    prefix_cache_hit_rate: meanOrNull(get('prefix_cache_hit_rate')),
+    kv_cache_percent: running.length === 1 ? meanOrNull(get('kv_cache_percent')) : null,
+    prefix_cache_hit_rate: weightedMeanOrNull(
+      get('prefix_cache_hit_rate').map((value, i) => ({
+        value,
+        weight: get('prefix_cache_queries_total')[i],
+      })),
+    ),
 
     // Tail latency — weighted mean per quantile.
     ttft_percentiles: aggregatePercentiles(
       metrics.map((m) => m?.ttft_percentiles ?? null),
-      weights,
+      get('ttft_observations'),
     ),
     itl_percentiles: aggregatePercentiles(
       metrics.map((m) => m?.itl_percentiles ?? null),
-      weights,
+      get('itl_observations'),
     ),
     e2e_percentiles: aggregatePercentiles(
       metrics.map((m) => m?.e2e_percentiles ?? null),
-      weights,
+      get('e2e_observations'),
     ),
 
     // Goodput — weighted mean by total_requests, same caveat as percentiles.
-    ttft_goodput_pct: weightedBy('ttft_goodput_pct'),
-    itl_goodput_pct: weightedBy('itl_goodput_pct'),
-    e2e_goodput_pct: weightedBy('e2e_goodput_pct'),
-    tpot_goodput_pct: weightedBy('tpot_goodput_pct'),
+    ttft_goodput_pct: weightedBy('ttft_goodput_pct', 'ttft_observations'),
+    itl_goodput_pct: weightedBy('itl_goodput_pct', 'itl_observations'),
+    e2e_goodput_pct: weightedBy('e2e_goodput_pct', 'e2e_observations'),
+    tpot_goodput_pct: weightedBy('tpot_goodput_pct', 'tpot_observations'),
   }
 }
