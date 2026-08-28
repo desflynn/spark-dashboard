@@ -18,6 +18,8 @@ interface ArcGaugeProps {
   size?: number | string
   /** Override the displayed number in the gauge center (e.g. show watts instead of percentage) */
   displayValue?: number
+  /** Suppress the SVG center number + unit (the caller renders its own overlay). */
+  hideCenter?: boolean
   /** When provided, renders a multi-segment arc with a color legend instead of a single-value arc. */
   segments?: GaugeSegment[]
 }
@@ -33,6 +35,7 @@ export const ArcGauge = React.memo(function ArcGauge({
   thresholds,
   size = 160,
   displayValue,
+  hideCenter = false,
   segments,
 }: ArcGaugeProps) {
   const filterId = useId()
@@ -146,7 +149,9 @@ export const ArcGauge = React.memo(function ArcGauge({
           })()
         )}
 
-        {/* Center value text */}
+        {/* Center value text (skipped when the caller overlays its own) */}
+        {!hideCenter && (
+          <>
         <text
           x="50%"
           y="43%"
@@ -175,6 +180,8 @@ export const ArcGauge = React.memo(function ArcGauge({
         >
           {unit}
         </text>
+          </>
+        )}
       </svg>
 
       {segmentsToRender.length > 0 && (

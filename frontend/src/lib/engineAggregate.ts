@@ -43,6 +43,7 @@ export interface AggregateSnapshot {
   e2e_latency_ms: number | null
   queue_time_ms: number | null
   inter_token_latency_ms: number | null
+  tpot_ms: number | null
   per_request_tps: number | null
   per_request_prompt_tps: number | null
 
@@ -64,6 +65,7 @@ export interface AggregateSnapshot {
   ttft_goodput_pct: number | null
   itl_goodput_pct: number | null
   e2e_goodput_pct: number | null
+  tpot_goodput_pct: number | null
 }
 
 function sumOrNull(values: Array<number | null | undefined>): number | null {
@@ -138,6 +140,7 @@ function emptySnapshot(totalCount: number): AggregateSnapshot {
     e2e_latency_ms: null,
     queue_time_ms: null,
     inter_token_latency_ms: null,
+    tpot_ms: null,
     per_request_tps: null,
     per_request_prompt_tps: null,
     avg_batch_size: null,
@@ -149,6 +152,7 @@ function emptySnapshot(totalCount: number): AggregateSnapshot {
     ttft_goodput_pct: null,
     itl_goodput_pct: null,
     e2e_goodput_pct: null,
+    tpot_goodput_pct: null,
   }
 }
 
@@ -310,6 +314,7 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
     e2e_latency_ms: weightedBy('e2e_latency_ms'),
     queue_time_ms: weightedBy('queue_time_ms'),
     inter_token_latency_ms: weightedBy('inter_token_latency_ms'),
+    tpot_ms: weightedBy('tpot_ms'),
     per_request_tps: weightedBy('per_request_tps'),
     per_request_prompt_tps: weightedBy('per_request_prompt_tps'),
 
@@ -336,5 +341,6 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
     ttft_goodput_pct: weightedBy('ttft_goodput_pct'),
     itl_goodput_pct: weightedBy('itl_goodput_pct'),
     e2e_goodput_pct: weightedBy('e2e_goodput_pct'),
+    tpot_goodput_pct: weightedBy('tpot_goodput_pct'),
   }
 }

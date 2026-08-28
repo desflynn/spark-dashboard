@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { findEngineByEndpoint } from '../lib/identity'
+import { formatRate } from '../lib/format'
 import type { EngineSnapshot } from '../types/metrics'
 
 /**
@@ -26,6 +27,10 @@ interface LogViewerProps {
    *  Global tab. */
   selectedEndpoint?: string | null
   onExpandChange?: (expanded: boolean) => void
+  /** Live bytes/sec rates shown on the console header. The stats are hidden
+   *  entirely unless both are provided. */
+  disk?: { read: number; write: number }
+  network?: { rx: number; tx: number }
 }
 
 /** Connection lifecycle of the log socket. `idle` while collapsed (lazy
@@ -33,7 +38,7 @@ interface LogViewerProps {
  *  runs without --enable-log-viewer, so /ws/logs is not registered. */
 type LogConnState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'unavailable'
 
-export function LogViewer({ engines = [], selectedEndpoint = null, onExpandChange }: LogViewerProps) {
+export function LogViewer({ engines = [], selectedEndpoint = null, onExpandChange, disk, network }: LogViewerProps) {
   const [logs, setLogs] = useState<string[]>([])
   const [connState, setConnState] = useState<LogConnState>('idle')
   const connected = connState === 'connected'
@@ -56,10 +61,22 @@ export function LogViewer({ engines = [], selectedEndpoint = null, onExpandChang
     return engines.find((e) => e.deployment_mode === 'Docker')?.endpoint ?? null
   }, [engines, selectedEndpoint])
 
-  const targetEngine = findEngineByEndpoint(engines, targetEndpoint)
-  const engineLabel = targetEngine
-    ? (targetEngine.model?.name ?? targetEngine.endpoint)
-    : null
+  // Scope shown in the header: the selected engine's model when a tab is bound,
+  // otherwise 'both engines' (the Global tab streams both containers).
+  const selectedEngine = selectedEndpoint
+    ? findEngineByEndpoint(engines, selectedEndpoint)
+    : undefined
+  const scopeLabel = selectedEngine
+    ? (selectedEngine.model?.name ?? selectedEngine.endpoint)
+    : 'both engines'
+
+  // Live rate stats on the header; empty when the caller did not send them.
+  const diskStat = disk
+    ? `disk ${formatRate(disk.read)} r · ${formatRate(disk.write)} w`
+    : ''
+  const netStat = network
+    ? `net ${formatRate(network.rx)} rx · ${formatRate(network.tx)} tx`
+    : ''
 
   // Identity of the connection the buffer belongs to: null while collapsed (no
   // socket at all), otherwise the container being streamed.
@@ -193,13 +210,17 @@ export function LogViewer({ engines = [], selectedEndpoint = null, onExpandChang
                      bg-[#111115] rounded-md border border-white/[0.04] hover:border-zinc-700 
                      transition-colors duration-200"
         >
-          ▶ Console Logs
-          {engineLabel && (
-            <span className="text-[10px] text-zinc-600 truncate max-w-[240px]">
-              {engineLabel}
+          <span className="flex items-center gap-2 min-w-0">
+            <span className="text-[11px] text-[#5b646e] leading-none">▸</span>
+            <span className="text-[12.5px] font-semibold">Console</span>
+            <span className="text-[11px] font-mono truncate max-w-[220px] text-[#5b646e]">
+              {scopeLabel}
             </span>
-          )}
-          <span className="text-zinc-600 ml-auto">click to stream</span>
+          </span>
+          <span className="flex items-center gap-3 shrink-0 text-[11px] font-mono text-[#5b646e]">
+            {diskStat && <span>{diskStat}</span>}
+            {netStat && <span>{netStat}</span>}
+          </span>
         </button>
       </div>
     )
@@ -208,65 +229,75 @@ export function LogViewer({ engines = [], selectedEndpoint = null, onExpandChang
   return (
     <div className="shrink-0 mt-2" onKeyDown={handleKeyDown}>
       {/* Header bar */}
-      <div className="flex items-center gap-2 px-3 py-1.5 bg-[#111115] rounded-t-md border border-white/[0.04] border-b-0 flex-wrap">
-        <button
-          onClick={() => { setCollapsed(true); onExpandChange?.(false) }}
-          className="text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors shrink-0"
-        >
-          ▼ Console Logs
-        </button>
-
-        {/* Connection indicator */}
-        <span
-          className={`inline-block w-1.5 h-1.5 rounded-full ${
-            connected
-              ? 'bg-[#76B900]'
-              : connState === 'reconnecting'
-                ? 'bg-yellow-400'
-                : 'bg-zinc-500'
-          }`}
-          title={connState}
-        />
-
-        {/* Which engine's container is being streamed */}
-        {engineLabel && (
-          <span className="text-[10px] text-zinc-600 truncate max-w-[240px] shrink-0">
-            {engineLabel}
-          </span>
-        )}
-
-        {/* Pause/Resume button */}
-        <button
-          onClick={togglePause}
-          className={`text-[11px] px-2 py-0.5 rounded font-medium transition-colors shrink-0 ${
-            paused
-              ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-          title={paused ? 'Resume — jump to latest' : 'Pause — freeze viewport'}
-        >
-          {paused ? '⏸ Paused' : '⏵ Live'}
-        </button>
-
-        {/* Line count */}
-        <span className="text-[10px] text-zinc-600 shrink-0">
-          {filteredLogs.length}/{logs.length}
-        </span>
-
-        {/* Scroll-to-bottom button (only when not auto-scrolling) */}
-        {!autoScroll && !paused && (
+      <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-[#111115] rounded-t-md border border-[#1d2226] border-b-0 flex-wrap">
+        {/* Left: caret + Console + scope label */}
+        <div className="flex items-center gap-2 min-w-0 flex-1">
           <button
-            onClick={() => {
-              setAutoScroll(true)
-              if (containerRef.current) {
-                containerRef.current.scrollTop = containerRef.current.scrollHeight
-              }
-            }}
-            className="text-[10px] text-yellow-400 hover:text-yellow-300 shrink-0"
+            onClick={() => { setCollapsed(true); onExpandChange?.(false) }}
+            className="flex items-center gap-2 shrink-0 focus-visible:outline-none"
           >
-            ↓ Auto-scroll
+            <span className="text-[11px] text-[#5b646e] leading-none">▹</span>
+            <span className="text-[12.5px] font-semibold text-zinc-200">Console</span>
           </button>
-        )}
+          <span className="text-[11px] font-mono truncate max-w-[200px] text-[#5b646e]">
+            {scopeLabel}
+          </span>
+        </div>
+
+        {/* Right: live stats, connection indicator, and controls */}
+        <div className="flex items-center gap-3 shrink-0">
+          {diskStat && (
+            <span className="text-[11px] font-mono text-[#5b646e]">{diskStat}</span>
+          )}
+          {netStat && (
+            <span className="text-[11px] font-mono text-[#5b646e]">{netStat}</span>
+          )}
+
+          {/* Connection indicator */}
+          <span
+            className={`inline-block w-1.5 h-1.5 rounded-full ${
+              connected
+                ? 'bg-[#76B900]'
+                : connState === 'reconnecting'
+                  ? 'bg-yellow-400'
+                  : 'bg-zinc-500'
+            }`}
+            title={connState}
+          />
+
+          {/* Pause/Resume button */}
+          <button
+            onClick={togglePause}
+            className={`text-[11px] px-2 py-0.5 rounded font-medium transition-colors shrink-0 ${
+              paused
+                ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+            title={paused ? 'Resume — jump to latest' : 'Pause — freeze viewport'}
+          >
+            {paused ? '⏸ Paused' : '⏵ Live'}
+          </button>
+
+          {/* Line count */}
+          <span className="text-[10px] text-zinc-600 shrink-0">
+            {filteredLogs.length}/{logs.length}
+          </span>
+
+          {/* Scroll-to-bottom button (only when not auto-scrolling) */}
+          {!autoScroll && !paused && (
+            <button
+              onClick={() => {
+                setAutoScroll(true)
+                if (containerRef.current) {
+                  containerRef.current.scrollTop = containerRef.current.scrollHeight
+                }
+              }}
+              className="text-[10px] text-yellow-400 hover:text-yellow-300 shrink-0"
+            >
+              ↓ Auto-scroll
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Filter bar */}
