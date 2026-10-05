@@ -111,3 +111,48 @@ line 405, test insertion 681); foreign hunks remain unstaged.
   `SPARK_DASHBOARD_IMAGE` back at ghcr latest and up -d; old image and the
   `spark-dashboard-state` volume stay untouched. No daemon/host/model/cache
   changes.
+
+### Unit 5 — deployment receipt + UI verification (2026-10-05 19:37–19:39 IST)
+
+- Isolated deploy tree: `git archive 7d7b93a` extracted to `/tmp/spark-dash-deploy`
+  on the Mac; verified my `is_vllm_container` present, foreign WIP absent.
+- Image: `docker build -f deploy/docker/Dockerfile --platform linux/arm64 -t
+  spark-dashboard:7d7b93a` on the Mac (warm cache; compile kept off the
+  Spark). Transfer `docker save | gzip | ssh docker load` → loaded
+  `spark-dashboard:7d7b93a` id `sha256:1401ba3c1ca2…`.
+- Config change with dated backup: `deploy/docker/.env` → `.env.bak-20261005`,
+  appended `SPARK_DASHBOARD_IMAGE=spark-dashboard:7d7b93a`.
+- `docker compose up -d` (project `docker`, deploy/docker): container
+  recreated and started, service `spark-dashboard` ONLY.
+- **Runtime binary delta proven:** `docker inspect spark-dashboard .Image` ==
+  `sha256:1401ba3c1ca2…` (exactly the new image); old ghcr image and all
+  rollback tags (`live-pp-cache`, `fleet-data-semantics-bak-…`) preserved;
+  `spark-dashboard-state` volume untouched; no `down -v`.
+- Health: container `(healthy)`; `GET :3000/healthz` → 200; `GET :3000/` → 200.
+- Startup log proves the fix live: `Detected engine: vLLM at
+  http://localhost:18300` (Qwen) AND `http://localhost:18312` (Ornith) — the
+  digest+wrapper container now passes the gate.
+- UI: OpenCLI screenshot of http://dgx-spark:3000 saved to
+  `evidence/2026-10-05-dashboard-after.png` (also `/tmp/spark-dash-after.png`):
+  header "SPARK FLEET · 2 ENGINES ON ONE BOX", per-model rows for
+  `/home/des/scratch/seat0u-model` and `/checkpoint`, Live indicator on.
+- Inference untouched after deploy (19:39 IST): qwen38-flash-nvidia-0z2 Up,
+  ornith-native-ssd-host-diagnostics-head-20261005 Up, health 200 on :18300
+  and :18312. No daemon/host/cache/sudo actions.
+
+### Test/commit summary
+
+- Focused counts: RED-1 `engines::detector::tests::` 21 passed / 2 failed
+  (label positives); GREEN full suite 177 passed. RED-2 (empty build-commit
+  label) 1 failed; GREEN full suite **178 passed, 0 failed**.
+- Commits pushed to fork `desflynn/spark-dashboard` branch
+  `fix/fleet-data-semantics`: `a3cab86` (label-aware gate + tests + evidence),
+  `7d7b93a` (non-empty build-commit value + evidence). Foreign worktree WIP
+  (parser hunks, frontend fleet redesign) remains uncommitted and unshipped.
+
+### Remaining gap
+
+- The other worker's uncommitted frontend/parser WIP is NOT deployed (owner
+  fence) — the running UI is the committed branch state + this fix.
+- Fix is branch-scoped: merging `fix/fleet-data-semantics` → `main` and a
+  follow-up mirror sync are the parent's call.
