@@ -402,7 +402,9 @@ fn is_vllm_container(
         return false;
     };
     labels.get(VLLM_IMAGE_SOURCE_LABEL).map(String::as_str) == Some(VLLM_IMAGE_SOURCE_VALUE)
-        || labels.contains_key(VLLM_BUILD_COMMIT_LABEL)
+        || labels
+            .get(VLLM_BUILD_COMMIT_LABEL)
+            .is_some_and(|v| !v.is_empty())
 }
 
 #[cfg(target_os = "linux")]
@@ -672,6 +674,18 @@ mod tests {
     fn build_commit_label_alone_is_evidence() {
         let labels = labels_of(&[("ai.vllm.build.commit", "abc123")]);
         assert!(is_vllm_container(
+            "sha256:0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
+            "bash /opt/seat0b-runtime/serve-262k.sh",
+            Some(&labels),
+        ));
+    }
+
+    #[test]
+    fn empty_build_commit_label_is_not_evidence() {
+        // Mere presence is not provenance: an empty value carries no commit
+        // and must not qualify a digest-pinned wrapper container.
+        let labels = labels_of(&[("ai.vllm.build.commit", "")]);
+        assert!(!is_vllm_container(
             "sha256:0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
             "bash /opt/seat0b-runtime/serve-262k.sh",
             Some(&labels),

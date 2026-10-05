@@ -87,3 +87,27 @@ Built a HEAD+mine-only patch (`git show HEAD:` + re-applied my three edits),
 - Foreign work still unstaged in the worktree: parser hunks at 276–368 and
   foreign tests — untouched. Nothing else was staged (`git diff --cached`
   empty before staging).
+
+### Unit 4 — empty build-commit label rejected (2026-10-05 ~19:47 IST)
+
+Owner pickup check: mere presence of `ai.vllm.build.commit` must not qualify.
+RED: `empty_build_commit_label_is_not_evidence` FAILED against the
+presence-only predicate. GREEN: build-commit label now requires a non-empty
+value; upstream source still exact-match. Full suite: **178 passed, 0
+failed**. Staged selectively again from HEAD `a3cab86` (2 hunks: predicate
+line 405, test insertion 681); foreign hunks remain unstaged.
+
+## Deployment plan
+
+- Isolated deploy tree: `git archive` of this branch's HEAD only — the shared
+  Mac worktree's foreign WIP (frontend fleet-redesign edits, detector/mod.rs
+  parser hunks) is NOT in the deploy context.
+- Build `linux/arm64` on the Mac (native, keeps the compile off the Spark's
+  ~7 GiB-available RAM and away from the 4 GiB fallback guard), transfer with
+  `docker save | gzip | ssh docker load`.
+- Remote: dated `.env` backup, set `SPARK_DASHBOARD_IMAGE` to the local tag,
+  `docker compose up -d spark-dashboard` from the existing compose dir
+  (project `docker`, files docker-compose.yml + override). Rollback = point
+  `SPARK_DASHBOARD_IMAGE` back at ghcr latest and up -d; old image and the
+  `spark-dashboard-state` volume stay untouched. No daemon/host/model/cache
+  changes.
