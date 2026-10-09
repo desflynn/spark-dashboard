@@ -133,6 +133,51 @@ function stubHistory() {
 }
 
 describe('Fleet Dashboard', () => {
+  it.each(['all', 'selected'])('restores Qwen native prefill values on the %s view', (tab) => {
+    const engine = makeEngine('http://localhost:18300', 'qwen3.8-flash-next');
+    Object.assign(engine.metrics!, {
+      pp_5min: 1250,
+      last_req_pp: 2000,
+      pp_lifetime: 49131 / 43.53384248999646,
+      pure_prefill_tokens: 49131,
+      total_prompt_tokens: 49131,
+    });
+    render(
+      <Dashboard
+        metrics={makeSnapshot([makeGpu(0)], [engine])}
+        history={{ getChartData: (key) => key.endsWith(':promptTps')
+          ? [{ timestamp: 1000, value: 100000, durationMs: 1000 }] : [] }}
+        events={[]} requests={[]}
+        activeTab={tab === 'all' ? 'all' : engineKey(engine)}
+        onActiveTabChange={vi.fn()}
+      />,
+    );
+    const card = screen.getByText('Prompt processing').closest('div')!.parentElement!.parentElement!;
+    expect(within(card).getByText('1.3k')).toBeInTheDocument();
+    expect(within(card).getByText('Last req')).toBeInTheDocument();
+    expect(within(card).getByText('2k tok/s')).toBeInTheDocument();
+    expect(within(card).getByText('Lifetime')).toBeInTheDocument();
+    expect(within(card).getByText('1.1k tok/s')).toBeInTheDocument();
+    expect(card).not.toHaveTextContent('100k');
+    if (tab === 'all') {
+      expect(screen.getByRole('button', { name: /Qwen 3.8 0Z2/ })).toHaveTextContent('1.3k')
+    }
+  });
+
+  it('does not substitute gross prompt spikes when the native window is empty', () => {
+    const engine = makeEngine('http://localhost:18300', 'qwen3.8-flash-next');
+    Object.assign(engine.metrics!, { pp_5min: null, last_req_pp: null, pp_lifetime: 1128.57 });
+    render(
+      <Dashboard metrics={makeSnapshot([makeGpu(0)], [engine])}
+        history={{ getChartData: () => [{ timestamp: 1000, value: 100000, durationMs: 1000 }] }}
+        events={[]} requests={[]} activeTab={engineKey(engine)} onActiveTabChange={vi.fn()} />,
+    );
+    const card = screen.getByText('Prompt processing').closest('div')!.parentElement!.parentElement!;
+    expect(within(card).getByText('—')).toBeInTheDocument();
+    expect(within(card).getByText('1.1k tok/s')).toBeInTheDocument();
+    expect(card).not.toHaveTextContent('100k');
+  });
+
   it('survives the metrics null → first-snapshot transition (initial WebSocket connect)', () => {
     const history = stubHistory()
     const spy = vi.fn()

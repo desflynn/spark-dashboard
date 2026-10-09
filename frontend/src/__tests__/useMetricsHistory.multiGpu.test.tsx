@@ -70,6 +70,26 @@ const baseSnapshot: MetricsSnapshot = {
 }
 
 describe('useMetricsHistory multi-GPU metrics', () => {
+  it('keeps restored Qwen prefill separate from the legacy gross-counter series', () => {
+    const engine = {
+      engine_type: 'Vllm', endpoint: 'http://localhost:18300',
+      status: { type: 'Running' }, model: null, deployment_mode: 'Docker',
+      gpu_indexes: [], recent_requests: [], sampled_at_ms: 900,
+      metrics: { pp_5min: 1250, prompt_tokens_per_sec: 100000, prompt_tokens_per_sec_interval_ms: 1000 },
+    } as unknown as MetricsSnapshot['engines'][number]
+    const snapshot = { ...baseSnapshot, engines: [engine] }
+    const { result, rerender } = renderHook(
+      ({ metrics }) => useMetricsHistory(metrics),
+      { initialProps: { metrics: snapshot } },
+    )
+    act(() => rerender({ metrics: { ...snapshot, timestamp_ms: 2000 } }))
+    const key = engineKey(engine)
+    expect(result.current.getChartData(`${key}:pp`)).toEqual([{ timestamp: 900, value: 1250 }])
+    expect(result.current.getChartData(`${key}:promptTps`)).toEqual([
+      { timestamp: 900, value: 100000, durationMs: 1000 },
+    ])
+  })
+
   it('keeps per-GPU chart series separate while preserving primary GPU keys', () => {
     const { result, rerender } = renderHook(
       ({ metrics }) => useMetricsHistory(metrics),

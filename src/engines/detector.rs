@@ -390,11 +390,7 @@ const VLLM_BUILD_COMMIT_LABEL: &str = "ai.vllm.build.commit";
 /// and commonly contain "vllm" for unrelated sidecars, so an LLM-named
 /// container (e.g. "qwen38-flash") with a digest image and a shell command
 /// and no vLLM labels must stay rejected.
-fn is_vllm_container(
-    image: &str,
-    command: &str,
-    labels: Option<&HashMap<String, String>>,
-) -> bool {
+fn is_vllm_container(image: &str, command: &str, labels: Option<&HashMap<String, String>>) -> bool {
     if image.contains("vllm") || command.contains("vllm") {
         return true;
     }

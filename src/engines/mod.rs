@@ -116,6 +116,14 @@ pub struct EngineMetrics {
     pub avg_prompt_tokens_per_sec: Option<f64>,
     /// Per-request average prompt throughput: prompt_tokens / prefill_time (tokens/sec).
     pub per_request_prompt_tps: Option<f64>,
+    /// Most recently completed request's reported computed-prefill rate.
+    pub last_req_pp: Option<f64>,
+    /// Sum of computed tokens / sum of prefill seconds for completions in 5 min.
+    pub pp_5min: Option<f64>,
+    /// Raw cumulative computed-prefill tokens / cumulative prefill seconds.
+    pub pp_lifetime: Option<f64>,
+    /// Raw cumulative computed-prefill token histogram sum.
+    pub pure_prefill_tokens: Option<u64>,
     /// Number of requests swapped to CPU memory (0 = healthy, >0 = memory pressure).
     pub swapped_requests: Option<u64>,
     /// GPU prefix cache hit rate as percentage (0-100).

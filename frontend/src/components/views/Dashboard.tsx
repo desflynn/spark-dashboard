@@ -6,6 +6,7 @@ import { SloSettingsControl } from '@/components/engines/SloSettingsControl'
 import { AreaSparkline } from '@/components/charts/AreaSparkline'
 import { aggregateEngines } from '@/lib/engineAggregate'
 import { engineKey, findEngineByKey, gpuIndexOf, snapshotGpus } from '@/lib/identity'
+import { engineDisplayOverride } from '@/lib/engineDisplay'
 import { formatCompactTokens, formatGiB, formatMhz, fmtInt } from '@/lib/format'
 import { THRESHOLDS } from '@/lib/theme'
 import { useSloSettings } from '@/hooks/useSloSettings'
@@ -99,6 +100,8 @@ interface ThroughputProps {
   big: string
   now: string
   perReq: string
+  nowLabel?: string
+  perReqLabel?: string
   total: string
   series: DataPoint[]
   color: string
@@ -114,6 +117,8 @@ function ThroughputCard({
   big,
   now,
   perReq,
+  nowLabel = 'Now',
+  perReqLabel = 'Per request',
   total,
   series,
   color,
@@ -179,8 +184,8 @@ function ThroughputCard({
         className="flex flex-wrap gap-4"
         style={{ borderTop: '1px solid #1d2226', paddingTop: '14px' }}
       >
-        <Foot label="Now" value={`${now} tok/s`} />
-        <Foot label="Per request" value={`${perReq} tok/s`} />
+        <Foot label={nowLabel} value={`${now} tok/s`} />
+        <Foot label={perReqLabel} value={`${perReq} tok/s`} />
         <Foot
           label={badge === 'PP' ? 'Total read' : 'Total written'}
           value={`${total} tok`}
@@ -398,22 +403,27 @@ export function Dashboard({
   const activeKey = !isAll && activeEngine ? engineKey(activeEngine) : ''
   const eng = (seriesName: string): DataPoint[] => readSeries(`${activeKey}:${seriesName}`)
 
-  // ---- Throughput (PP / TG): 5-min average from history ----
-  const ppMean = isAll
-    ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)), nowMs)
-    : activeWindowMean(eng('promptTps'), nowMs)
+  // Restore Qwen's former native PP values without mixing them with other
+  // engines' gross-counter rates. All uses this path only when Qwen is alone.
+  const prefillEngine = isAll && running.length === 1 ? running[0] : activeEngine
+  const restoredPrefill = prefillEngine?.endpoint === 'http://localhost:18300'
+  const ppMean = restoredPrefill
+    ? prefillEngine?.metrics?.pp_5min
+    : isAll
+      ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)), nowMs)
+      : activeWindowMean(eng('promptTps'), nowMs)
   const tgMean = isAll
     ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:tps`)), nowMs)
     : activeWindowMean(eng('tps'), nowMs)
 
   // Live (instantaneous) values from the snapshot, aggregated or per-engine.
-  const ppNow = isAll
-    ? aggregate.prompt_tokens_per_sec
-    : activeEngine?.metrics?.prompt_tokens_per_sec
+  const ppNow = restoredPrefill
+    ? prefillEngine?.metrics?.last_req_pp
+    : isAll ? aggregate.prompt_tokens_per_sec : activeEngine?.metrics?.prompt_tokens_per_sec
   const tgNow = isAll ? aggregate.tokens_per_sec : activeEngine?.metrics?.tokens_per_sec
-  const ppPerReq = isAll
-    ? aggregate.per_request_prompt_tps
-    : activeEngine?.metrics?.per_request_prompt_tps
+  const ppPerReq = restoredPrefill
+    ? prefillEngine?.metrics?.pp_lifetime
+    : isAll ? aggregate.per_request_prompt_tps : activeEngine?.metrics?.per_request_prompt_tps
   const tgPerReq = isAll
     ? aggregate.per_request_tps
     : activeEngine?.metrics?.per_request_tps
@@ -424,9 +434,11 @@ export function Dashboard({
     ? aggregate.total_generation_tokens
     : activeEngine?.metrics?.total_generation_tokens
 
-  const ppSeries = isAll
-    ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)))
-    : sumConcurrentSeries([eng('promptTps')])
+  const ppSeries = restoredPrefill && prefillEngine
+    ? sumConcurrentSeries([readSeries(`${engineKey(prefillEngine)}:pp`)])
+    : isAll
+      ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)))
+      : sumConcurrentSeries([eng('promptTps')])
   const tgSeries = isAll
     ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:tps`)))
     : sumConcurrentSeries([eng('tps')])
@@ -436,10 +448,14 @@ export function Dashboard({
       badge: 'PP',
       badgeColor: GOOD,
       title: 'Prompt processing',
-      sub: 'prefill · tokens read',
+      sub: restoredPrefill
+        ? `uncached${prefillEngine?.metrics?.pure_prefill_tokens == null ? '' : ` · ${formatCompactTokens(prefillEngine.metrics.pure_prefill_tokens)} tok`}`
+        : 'prefill · tokens read',
       big: fmtOptional(ppMean),
       now: fmtOptional(ppNow),
       perReq: fmtOptional(ppPerReq),
+      nowLabel: restoredPrefill ? 'Last req' : 'Now',
+      perReqLabel: restoredPrefill ? 'Lifetime' : 'Per request',
       total: ppTotal == null ? '—' : formatCompactTokens(ppTotal),
       series: ppSeries,
       color: GOOD,
@@ -698,6 +714,8 @@ export function Dashboard({
           big={throughput.pp.big}
           now={throughput.pp.now}
           perReq={throughput.pp.perReq}
+          nowLabel={throughput.pp.nowLabel}
+          perReqLabel={throughput.pp.perReqLabel}
           total={throughput.pp.total}
           series={throughput.pp.series}
           color={throughput.pp.color}
@@ -769,13 +787,15 @@ export function Dashboard({
                 engine.model?.precision,
                 engine.model?.pipeline_tag,
               ].filter((p): p is string => p != null && p.length > 0)
-              const ppMeanE = activeWindowMean(readSeries(`${key}:promptTps`), nowMs)
+              const ppMeanE = engine.endpoint === 'http://localhost:18300'
+                ? engine.metrics?.pp_5min
+                : activeWindowMean(readSeries(`${key}:promptTps`), nowMs)
               const tgMeanE = activeWindowMean(readSeries(`${key}:tps`), nowMs)
               const ttftE = engine.metrics!.ttft_ms
               return (
                 <ModelRow
                   key={key}
-                  name={engine.model?.name ?? key}
+                  name={engineDisplayOverride(engine) ?? engine.model?.name ?? key}
                   meta={metaParts.join(' · ')}
                   pp={fmtOptional(ppMeanE)}
                   tg={fmtOptional(tgMeanE)}

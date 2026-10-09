@@ -139,6 +139,11 @@ export interface EngineMetrics {
   prompt_tokens_per_sec_interval_ms: number | null
   avg_prompt_tokens_per_sec: number | null
   per_request_prompt_tps: number | null
+  /** Restored custom Qwen prefill fields; not inferred from gross prompt rates. */
+  last_req_pp?: number | null
+  pp_5min?: number | null
+  pp_lifetime?: number | null
+  pure_prefill_tokens?: number | null
   swapped_requests: number | null
   prefix_cache_hit_rate: number | null
   queue_time_ms: number | null

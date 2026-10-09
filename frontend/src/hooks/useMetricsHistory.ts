@@ -153,6 +153,7 @@ export function useMetricsHistory(
           prefixCacheHit: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           e2eLatency: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           e2eObservations: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          pp: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           promptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           avgPromptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           perReqPromptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
@@ -217,6 +218,9 @@ export function useMetricsHistory(
         }
         if (engine.metrics.e2e_observations !== null) {
           eb.e2eObservations.push({ timestamp: engineTs, value: engine.metrics.e2e_observations })
+        }
+        if (engine.endpoint === 'http://localhost:18300' && engine.metrics.pp_5min != null) {
+          eb.pp.push({ timestamp: engineTs, value: engine.metrics.pp_5min })
         }
         if (engine.metrics.prompt_tokens_per_sec !== null) {
           eb.promptTps.push({

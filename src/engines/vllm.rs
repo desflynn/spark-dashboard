@@ -7,8 +7,25 @@ use super::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/// Paired native prefill histogram values from one scrape.
+#[derive(Clone, Copy, Debug)]
+struct PrefillSample {
+    pkc_sum: f64,
+    pt_sum: f64,
+    pt_count: u64,
+}
+
+/// Historical request-completion sample for the five-minute PP window.
+#[derive(Clone, Copy, Debug)]
+struct PpSample {
+    at: Instant,
+    dtok: f64,
+    dsec: f64,
+}
 
 /// Default number of requests to skip on engine startup before baselining.
 /// vLLM's first inference is dominated by CUDA kernel JIT and KV cache
@@ -83,6 +100,9 @@ pub struct VllmAdapter {
     prev_gen_tokens: Mutex<Option<(f64, Instant)>>,
     /// Previous prompt_tokens_total counter reading for rate computation.
     prev_prompt_tokens: Mutex<Option<(f64, Instant)>>,
+    prev_prefill: Mutex<Option<PrefillSample>>,
+    pp_ring: Mutex<VecDeque<PpSample>>,
+    last_req_pp: Mutex<Option<f64>>,
     /// Previous (accepted, draft) spec-decode counter readings, used to compute
     /// the live (windowed) token acceptance rate from per-poll deltas. No
     /// timestamp is stored because the live TAR is a unit-free ratio of deltas.
@@ -130,6 +150,9 @@ impl VllmAdapter {
             served_model,
             prev_gen_tokens: Mutex::new(None),
             prev_prompt_tokens: Mutex::new(None),
+            prev_prefill: Mutex::new(None),
+            pp_ring: Mutex::new(VecDeque::new()),
+            last_req_pp: Mutex::new(None),
             prev_spec_decode: Mutex::new(None),
             avg_accum: Mutex::new((0.0, 0)),
             avg_prompt_accum: Mutex::new((0.0, 0)),
@@ -448,6 +471,9 @@ impl EngineAdapter for VllmAdapter {
         if warmup_out.just_transitioned {
             *self.prev_gen_tokens.lock().await = None;
             *self.prev_prompt_tokens.lock().await = None;
+            *self.prev_prefill.lock().await = None;
+            self.pp_ring.lock().await.clear();
+            *self.last_req_pp.lock().await = None;
             *self.prev_spec_decode.lock().await = None;
             *self.avg_accum.lock().await = (0.0, 0);
             *self.avg_prompt_accum.lock().await = (0.0, 0);
@@ -539,6 +565,71 @@ impl EngineAdapter for VllmAdapter {
             }
             rate
         };
+
+        // Restore the pre-October custom PP path. Native histograms report
+        // computed tokens and prefill seconds together at completion; gross
+        // prompt-counter jumps and TTFT are not its rate inputs. Raw values
+        // preserve lifetime totals across the dashboard warmup baseline.
+        let curr_prefill = {
+            let pkc_sum = raw
+                .counters
+                .get("vllm_request_prefill_kv_computed_tokens_sum")
+                .copied();
+            let pt_sum = raw
+                .counters
+                .get("vllm_request_prefill_time_seconds_sum")
+                .copied();
+            let pt_count = raw
+                .counters
+                .get("vllm_request_prefill_time_seconds_count")
+                .copied();
+            match (pkc_sum, pt_sum, pt_count) {
+                (Some(a), Some(c), Some(d)) => Some(PrefillSample {
+                    pkc_sum: a,
+                    pt_sum: c,
+                    pt_count: d as u64,
+                }),
+                _ => None,
+            }
+        };
+        let (last_req_pp, pp_5min) = {
+            let mut prev = self.prev_prefill.lock().await;
+            let mut ring = self.pp_ring.lock().await;
+            let mut last = self.last_req_pp.lock().await;
+            if let (Some(cur), Some(pv)) = (curr_prefill, *prev) {
+                if let Some((dtok, dsec)) = detect_pp_completion(pv, cur) {
+                    ring.push_back(PpSample {
+                        at: now,
+                        dtok,
+                        dsec,
+                    });
+                    *last = Some(dtok / dsec);
+                }
+            }
+            if let Some(cutoff) = now.checked_sub(Duration::from_secs(300)) {
+                while ring.front().is_some_and(|front| front.at < cutoff) {
+                    ring.pop_front();
+                }
+            }
+            if curr_prefill.is_some() {
+                *prev = curr_prefill;
+            }
+            let pp_5min = if ring.is_empty() {
+                None
+            } else {
+                let (tokens, seconds) = ring
+                    .iter()
+                    .fold((0.0_f64, 0.0_f64), |(t, s), r| (t + r.dtok, s + r.dsec));
+                if seconds > 0.0 {
+                    Some(tokens / seconds)
+                } else {
+                    None
+                }
+            };
+            (*last, pp_5min)
+        };
+        let pp_lifetime = curr_prefill.and_then(pp_lifetime_rate);
+        let pure_prefill_tokens = curr_prefill.map(|sample| sample.pkc_sum as u64);
 
         // Prompt tokens/sec from prompt_tokens_total counter (rate = delta / elapsed)
         let current_prompt = parsed.counters.get("vllm_prompt_tokens_total").copied();
@@ -890,6 +981,10 @@ impl EngineAdapter for VllmAdapter {
                 avg_prompt_tokens_per_sec
             },
             per_request_prompt_tps: if blank { None } else { per_request_prompt_tps },
+            last_req_pp: if blank { None } else { last_req_pp },
+            pp_5min: if blank { None } else { pp_5min },
+            pp_lifetime: if blank { None } else { pp_lifetime },
+            pure_prefill_tokens: if blank { None } else { pure_prefill_tokens },
             swapped_requests,
             prefix_cache_hit_rate,
             queue_time_ms: if blank { None } else { queue_time_ms },
@@ -957,9 +1052,89 @@ fn spec_mean_acceptance_length(accepted: Option<f64>, drafts: Option<f64>) -> Op
     }
 }
 
+/// Historical completion derivation: one or more new observations must have
+/// a positive prefill-time delta and a non-negative computed-token delta.
+fn detect_pp_completion(prev: PrefillSample, cur: PrefillSample) -> Option<(f64, f64)> {
+    if cur.pt_count <= prev.pt_count {
+        return None;
+    }
+    let dtok = cur.pkc_sum - prev.pkc_sum;
+    let dsec = cur.pt_sum - prev.pt_sum;
+    if dsec > 0.0 && dtok >= 0.0 {
+        Some((dtok, dsec))
+    } else {
+        None
+    }
+}
+
+fn pp_lifetime_rate(sample: PrefillSample) -> Option<f64> {
+    if sample.pt_sum > 0.0 {
+        Some(sample.pkc_sum / sample.pt_sum)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restored_qwen_prefill_uses_native_counters_and_keeps_idle_values() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // First row is the saved current Qwen receipt. Later rows exercise
+            // the historical completion window without calling a real model.
+            for (tokens, seconds, count, gross) in [
+                (49131.0, 43.53384248999646, 5, 49131),
+                (50131.0, 44.03384248999646, 6, 2000000),
+                (51631.0, 45.53384248999646, 7, 3000000),
+                (51631.0, 45.53384248999646, 7, 3000000),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let size = socket.read(&mut request).await.unwrap();
+                assert!(std::str::from_utf8(&request[..size])
+                    .unwrap()
+                    .starts_with("GET /metrics "));
+                let body = format!(
+                    "vllm:prompt_tokens_total {gross}\n\
+                     vllm:request_prefill_kv_computed_tokens_sum {tokens}\n\
+                     vllm:request_prefill_time_seconds_sum {seconds}\n\
+                     vllm:request_prefill_time_seconds_count {count}\n\
+                     vllm:time_to_first_token_seconds_sum 45.224502086639404\n\
+                     vllm:time_to_first_token_seconds_count {count}\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let adapter = VllmAdapter::new(reqwest::Client::new(), endpoint, None, None);
+        *adapter.warmup.lock().await = WarmupTracker::new(0);
+        let initial = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        let expected = 49131.0 / 43.53384248999646;
+        assert!((initial["pp_lifetime"].as_f64().unwrap_or(-1.0) - expected).abs() < 1e-9);
+        assert_eq!(initial["pure_prefill_tokens"], 49131);
+        assert!(initial["pp_5min"].is_null());
+
+        let first = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        assert_eq!(first["last_req_pp"], 2000.0);
+        assert_eq!(first["pp_5min"], 2000.0);
+        let second = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        assert_eq!(second["last_req_pp"], 1000.0);
+        assert_eq!(second["pp_5min"], 1250.0);
+        let idle = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        assert_eq!(idle["last_req_pp"], second["last_req_pp"]);
+        assert_eq!(idle["pp_5min"], second["pp_5min"]);
+        server.await.unwrap();
+    }
 
     #[test]
     fn counter_rate_uses_elapsed_time_and_rejects_counter_resets() {
