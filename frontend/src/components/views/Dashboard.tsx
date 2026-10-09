@@ -1,414 +1,1467 @@
-import { useCallback, useState } from 'react'
-import { ArcGauge, type GaugeSegment } from '@/components/gauges/ArcGauge'
-import { HBar } from '@/components/gauges/HBar'
+import { useEffect } from 'react'
+import { ArcGauge } from '@/components/gauges/ArcGauge'
 import { CoreHeatmap } from '@/components/charts/CoreHeatmap'
-import { TimeSeriesChart } from '@/components/charts/TimeSeriesChart'
-import { EngineSection } from '@/components/engines/EngineSection'
-import { useElementSize } from '@/hooks/useElementSize'
+import { StackedBar, type BarSegment } from '@/components/StackedBar'
+import { SloSettingsControl } from '@/components/engines/SloSettingsControl'
+import { AreaSparkline } from '@/components/charts/AreaSparkline'
+import { Sparkline } from '@/components/charts/Sparkline'
+import { aggregateEngines } from '@/lib/engineAggregate'
+import { engineKey, findEngineByKey, gpuIndexOf, snapshotGpus } from '@/lib/identity'
+import { engineDisplayOverride, orderEnginesForDisplay } from '@/lib/engineDisplay'
+import { formatCompactTokens, formatGiB, formatMhz, fmtInt } from '@/lib/format'
 import { THRESHOLDS } from '@/lib/theme'
-import { formatBytes, formatGiB, formatMhz, formatRate } from '@/lib/format'
-import { computePowerScale, powerPeak } from '@/lib/gpuPower'
-import { findGpuByIndex, gpuIndexOf, snapshotGpus } from '@/lib/identity'
+import { useSloSettings } from '@/hooks/useSloSettings'
+import {
+  COOL,
+  GOOD,
+  WARN,
+  alpha,
+  activeFleetWindowMean,
+  activeWindowMean,
+  fmt,
+  fmtOptional,
+  fmtSeconds,
+  firstTokColor,
+  gpuTempColor,
+  goodputColor,
+  memFreeColor,
+  memoryBreakdown,
+  queueColor,
+  sumConcurrentSeries,
+  tarColor,
+  wholeAnswerColor,
+  weightedSeries,
+  type DataPoint,
+} from '@/lib/fleet'
 import type { MetricsSnapshot } from '@/types/metrics'
 import type { GpuEvent, InferenceRequest } from '@/types/events'
 
+/** Props mirror the App-provided contract exactly: App owns the header tabs and
+ *  owns the `activeTab` state, reporting selection back through
+ *  `onActiveTabChange`. `onActiveEngineChange` keeps the log viewer scoped to the
+ *  selected model (undefined = the All tab). */
 interface DashboardProps {
   metrics: MetricsSnapshot | null
   history: {
-    getChartData: (metric: string) => Array<{ timestamp: number; value: number }>
-    getSparklineData: (metric: string, count?: number) => number[]
+    getChartData: (metric: string) => DataPoint[]
+    getPpChart?: (engineKey?: string) => DataPoint[]
+    getPpGreyChart?: (engineKey?: string) => DataPoint[]
   }
   events: GpuEvent[]
   requests: InferenceRequest[]
+  activeTab: 'all' | string
+  onActiveTabChange: (tab: 'all' | string) => void
   collapseCharts?: boolean
-  /** Forwarded to EngineSection; reports the selected engine tab's endpoint
-   *  (undefined = Global tab) so the log viewer can follow the selection. */
   onActiveEngineChange?: (endpoint: string | undefined) => void
 }
 
-function HwCard({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
+/** One cell of the summary row. */
+function SummaryCell({
+  label,
+  children,
+}: {
+  label: string
+  children: React.ReactNode
+}) {
   return (
-    <div className="bg-[#111115] rounded-md sm:rounded-lg border border-white/[0.04] px-1.5 pt-1 pb-0.5 lg:px-2 lg:pt-1.5 lg:pb-1 2xl:px-2.5 2xl:pt-2 2xl:pb-1.5 flex flex-col min-h-0 min-w-0 overflow-hidden transition-colors duration-200 hover:border-[#76B900]/10">
-      {(title || subtitle) && (
-        <div className="mb-0.5 2xl:mb-1 flex items-baseline gap-1.5 min-w-0 shrink-0">
-          {title && <span className="text-[10px] lg:text-[11px] 2xl:text-xs min-[1920px]:text-sm font-semibold text-zinc-200 tracking-tight shrink-0">{title}</span>}
-          {title && subtitle && <span className="text-zinc-600 shrink-0 hidden lg:inline">·</span>}
-          {subtitle && <span className="hidden lg:inline text-[10px] 2xl:text-[11px] min-[1920px]:text-xs text-zinc-400 truncate min-w-0" title={subtitle}>{subtitle}</span>}
-        </div>
-      )}
+    <div
+      className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1"
+      style={{ padding: '7px 17px', flex: '1 1 240px', minWidth: 0 }}
+    >
+      <div
+        className="uppercase shrink-0"
+        style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+      >
+        {label}
+      </div>
       {children}
     </div>
   )
 }
 
-/** Shared responsive height for hardware mini-charts and gauges.
- *  Aggressive lower bounds keep the heatmap and memory split visible on
- *  cramped screens (13" laptops); upper bounds let big monitors breathe. */
-const HW_CHART_HEIGHT = 'clamp(28px, 7vh, 140px)'
-const HW_GAUGE_PX = 'clamp(36px, 5vw, 96px)'
+/** A label/value pair inside a card footer (Now / Per request / Total, etc.). */
+function Foot({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5 min-w-[88px]">
+      <div
+        className="uppercase"
+        style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+      >
+        {label}
+      </div>
+      <div
+        className="font-mono tabular-nums"
+        style={{ fontSize: '16px', fontWeight: 500, color: '#e7eaed' }}
+      >
+        {value}
+      </div>
+    </div>
+  )
+}
 
-/** Number of hardware cards in the grid (used to estimate per-card height). */
-const HW_CARD_COUNT = 8
-/** Below this per-card height (px) the cards drop their line charts and swap
- *  square gauges for compact horizontal bars, so the dashboard stays a
- *  one-pager when vertical space is tight. */
-const HW_COMPACT_HEIGHT_PX = 124
-/** Below this dashboard-content height (px) the engine section drops its
- *  per-metric trend charts. The engine block is content-sized (shrink-0), so on
- *  short viewports its charts would otherwise crowd the hardware grid off-screen
- *  — hiding them frees the room the hardware cards need to stay visible. Keyed
- *  off the (viewport-driven, content-independent) root height so it cannot
- *  feedback-loop with the hardware per-card measurement below. */
-const ENGINE_CHARTS_MIN_HEIGHT_PX = 640
+interface FootCell {
+  label: string
+  value: string
+  unit?: string
+}
+
+interface ThroughputProps {
+  badge: string
+  badgeColor: string
+  title: string
+  sub: string
+  big: string
+  bigSub?: string
+  feet: FootCell[]
+  series: DataPoint[]
+  underlaySeries?: DataPoint[]
+  color: string
+  height: number
+  nowMs: number
+  active?: boolean
+}
+
+function PulseDots({ color, on }: { color: string; on: boolean }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1"
+      aria-hidden="true"
+      style={{ opacity: on ? 1 : 0, transition: 'opacity 200ms' }}
+    >
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="animate-pulse"
+          style={{
+            width: 5,
+            height: 5,
+            borderRadius: '50%',
+            background: color,
+            animationDelay: `${i * 200}ms`,
+          }}
+        />
+      ))}
+    </span>
+  )
+}
+
+function ThroughputCard({
+  badge,
+  badgeColor,
+  title,
+  sub,
+  big,
+  bigSub,
+  feet,
+  series,
+  underlaySeries,
+  color,
+  height,
+  nowMs,
+  active = false,
+}: ThroughputProps) {
+  return (
+    <div
+      className="flex flex-col min-w-0 min-h-0"
+      style={{
+        flex: '1 1 320px',
+        background: '#101214',
+        border: '1px solid #1d2226',
+        borderRadius: '16px',
+        padding: 'clamp(18px, 1.6vw, 26px)',
+        gap: '16px',
+      }}
+    >
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2.5">
+          <span
+            className="inline-block shrink-0"
+            style={{
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: '11px',
+              fontWeight: 600,
+              color: badgeColor,
+              background: alpha(badgeColor, 0.13),
+              borderRadius: '5px',
+              padding: '3px 7px',
+            }}
+          >
+            {badge}
+          </span>
+          <span style={{ fontSize: '14px', fontWeight: 600 }}>{title}</span>
+        </div>
+        <span style={{ fontSize: '11.5px', color: '#78828c' }}>{sub}</span>
+      </div>
+
+      <div className="flex items-end gap-3 flex-wrap">
+        <span
+          className="font-mono tabular-nums shrink-0"
+          style={{
+            fontSize: 'clamp(54px, 7vw, 104px)',
+            fontWeight: 600,
+            letterSpacing: '-0.045em',
+            lineHeight: 0.85,
+            color: '#e7eaed',
+          }}
+        >
+          {big}
+        </span>
+        <div className="flex flex-col gap-0.5 pb-1.5">
+          <div style={{ fontSize: '17px', color: '#8b949d' }}>tok/s</div>
+          <div
+            className="flex items-center gap-1.5"
+            style={{ fontSize: '11.5px', color: '#78828c' }}
+          >
+            <PulseDots color={color} on={active} />
+            <span>{bigSub ?? '5-min average'}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="relative" style={{ height, margin: '0 -6px' }}>
+        <AreaSparkline
+          data={series}
+          underlay={underlaySeries}
+          color={color}
+          height={height}
+          nowMs={nowMs}
+        />
+      </div>
+
+      <div
+        className="flex flex-wrap gap-4"
+        style={{ borderTop: '1px solid #1d2226', paddingTop: '14px' }}
+      >
+        {feet.map((f) => (
+          <Foot
+            key={f.label}
+            label={f.label}
+            value={f.unit ? `${f.value} ${f.unit}` : f.value}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+interface ModelRowProps {
+  name: string
+  meta: string
+  pp: string
+  tg: string
+  ttft: string
+  ttftColor: string
+  hit: string
+  active: string
+  queued: string
+  series: DataPoint[]
+  color: string
+  onSelect: () => void
+  nowMs: number
+}
+
+function ModelRow({
+  name,
+  meta,
+  pp,
+  tg,
+  ttft,
+  ttftColor,
+  hit,
+  active,
+  queued,
+  series,
+  color,
+  onSelect,
+  nowMs,
+}: ModelRowProps) {
+  return (
+    <div
+      onClick={onSelect}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onSelect()
+        }
+      }}
+      className="flex flex-wrap items-center cursor-pointer min-w-0 min-h-0"
+      style={{
+        background: '#141719',
+        border: '1px solid #1d2226',
+        borderRadius: '12px',
+        padding: '15px 18px',
+        gap: '14px 22px',
+      }}
+      aria-pressed="false"
+    >
+      <div className="flex flex-col gap-1.5" style={{ flex: '2 1 210px', minWidth: 0 }}>
+        <div
+          className="font-mono truncate"
+          style={{ fontSize: '14.5px', fontWeight: 500, letterSpacing: '-0.01em', color: '#e7eaed' }}
+          title={name}
+        >
+          {name}
+        </div>
+        {meta.length > 0 && (
+          <div style={{ fontSize: '11.5px', color: '#78828c' }}>{meta}</div>
+        )}
+      </div>
+
+      <Col label="PP" value={<MonoBig>{pp}</MonoBig>} />
+      <Col label="TG" value={<MonoBig>{tg}</MonoBig>} />
+      <Col
+        label="First tok"
+        value={
+          <MonoBig>
+            <span style={{ color: ttftColor }}>{ttft}</span>
+            <span style={{ fontSize: '12px', color: '#8b949d', fontWeight: 400 }}> s</span>
+          </MonoBig>
+        }
+      />
+      <Col
+        label="Cache hit"
+        value={
+          <MonoBig>
+            <span style={{ color: '#e7eaed' }}>{hit}</span>
+            <span style={{ fontSize: '12px', color: '#8b949d', fontWeight: 400 }}> %</span>
+          </MonoBig>
+        }
+      />
+      <Col
+        label="In flight"
+        value={
+          <MonoBig>
+            <span style={{ color: '#e7eaed', whiteSpace: 'nowrap' }}>
+              {active} / {queued}
+              <span style={{ fontSize: '12px', color: '#8b949d', fontWeight: 400 }}> q</span>
+            </span>
+          </MonoBig>
+        }
+      />
+      <div className="flex-1 min-w-0 min-h-0" style={{ height: '44px' }}>
+        <AreaSparkline data={series} color={color} height={44} nowMs={nowMs} />
+      </div>
+    </div>
+  )
+}
+
+/** Wrapper for the 24px engine-table numbers so they share mono styling. */
+function MonoBig({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      className="font-mono tabular-nums"
+      style={{ fontSize: '24px', fontWeight: 600, letterSpacing: '-0.02em', color: '#e7eaed' }}
+    >
+      {children}
+    </span>
+  )
+}
+
+/** A column header + value inside the per-model row. */
+function Col({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5" style={{ flex: '0 1 96px', minWidth: 0 }}>
+      <div
+        className="uppercase"
+        style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+      >
+        {label}
+      </div>
+      {value}
+    </div>
+  )
+}
+
+/** A colored status pill ("Requests meeting each target"). */
+function GoodputChip({
+  label,
+  pct,
+  color,
+}: {
+  label: string
+  pct: number | null
+  color: string
+}) {
+  return (
+    <div
+      className="flex items-center gap-2 shrink-0"
+      style={{
+        background: alpha(color, 0.08),
+        border: `1px solid ${alpha(color, 0.25)}`,
+        borderRadius: '999px',
+        padding: '6px 12px 6px 10px',
+      }}
+    >
+      <div
+        className="shrink-0"
+        style={{ width: '6px', height: '6px', borderRadius: '50%', background: color }}
+      />
+      <span style={{ fontSize: '12px', color: '#a6aeb5' }}>{label}</span>
+      <span className="font-mono tabular-nums" style={{ fontSize: '13px', fontWeight: 600, color }}>
+        {pct == null ? '—' : Math.round(pct)}%
+      </span>
+    </div>
+  )
+}
+
+const GIB = 1_073_741_824
 
 export function Dashboard({
   metrics,
   history,
-  events,
-  requests,
-  collapseCharts = false,
+  activeTab,
+  onActiveTabChange,
   onActiveEngineChange,
 }: DashboardProps) {
-  // Which GPU the hardware chart panels show on multi-GPU hosts. Held above
-  // the early return so incoming snapshots cannot reset it.
-  const [selectedGpuIndex, setSelectedGpuIndex] = useState(0)
-  const handleActiveEngineGpuChange = useCallback((gpuIndexes?: number[]) => {
-    if (!gpuIndexes || gpuIndexes.length === 0) return
-    setSelectedGpuIndex((current) => gpuIndexes.includes(current) ? current : gpuIndexes[0])
-  }, [])
+  // Engines (empty when no snapshot yet). Computed before the early return so
+  // the hook below can be called unconditionally.
+  const engines = orderEnginesForDisplay(metrics?.engines ?? [])
 
-  // Measure the hardware grid to adapt to available *vertical* space. The grid
-  // uses auto-rows-fr, so per-card height depends only on the container height
-  // and the column count (2 below the `sm` breakpoint, 4 at/above it) — not on
-  // card content, which keeps this free of layout feedback loops. `compact`
-  // stays false until measured (height 0) so the full layout renders first.
-  const [hwGridRef, hwGridSize] = useElementSize<HTMLDivElement>()
-  const hwCols = hwGridSize.width >= 640 ? 4 : 2
-  const hwRows = Math.ceil(HW_CARD_COUNT / hwCols)
-  const perCardHeight =
-    hwGridSize.height > 0 ? (hwGridSize.height - (hwRows - 1) * 6) / hwRows : 0
-  const compact = perCardHeight > 0 && perCardHeight < HW_COMPACT_HEIGHT_PX
+  // The effective engine for the current tab. A stale key (not present) falls
+  // back to the All view.
+  const activeEngine = findEngineByKey(engines, activeTab)
+  const isAll = activeTab === 'all' || activeTab === '' || !activeEngine
 
-  // Engine trend charts collapse on short viewports (see constant). Default to
-  // showing them until the root is measured (height 0).
-  // All hooks sit above this early return: the hook count must not change when
-  // the first snapshot flips `metrics` from null, or React unmounts the tree
-  // ("Rendered more hooks than during the previous render").
-  const [rootRef, rootSize] = useElementSize<HTMLDivElement>()
-  const showEngineCharts = rootSize.height === 0 || rootSize.height >= ENGINE_CHARTS_MIN_HEIGHT_PX
+  // SLO settings scope to the model tab; read-only defaults on All. Called
+  // unconditionally (stable hook position) even when disabled.
+  const scopeModel = isAll ? null : activeEngine?.model?.name ?? null
+  const slo = useSloSettings(isAll ? '' : engineKey(activeEngine!), scopeModel)
+
+  // Keep the log viewer scoped to the selected model; undefined on All.
+  useEffect(() => {
+    onActiveEngineChange?.(isAll ? undefined : activeEngine?.endpoint)
+  }, [isAll, activeEngine?.endpoint, onActiveEngineChange])
 
   if (!metrics) return null
 
+  const nowMs = metrics.timestamp_ms
   const gpus = snapshotGpus(metrics)
   const multiGpu = gpus.length > 1
-  // Fall back to the primary GPU if the selected index vanishes from the feed.
-  const activeGpu = findGpuByIndex(gpus, selectedGpuIndex) ?? gpus[0]
-  const activeGpuIndex = gpuIndexOf(activeGpu)
-  // Single-GPU hosts keep the legacy un-prefixed history keys so the
-  // pre-multi-GPU rendering stays identical; multi-GPU hosts read the
-  // `gpu:<index>:<metric>` series written by useMetricsHistory.
-  const gpuMetricKey = (metric: string) => (multiGpu ? `gpu:${activeGpuIndex}:${metric}` : metric)
-  const gpuName = activeGpu.name ?? undefined
-  const gpuSubtitle = multiGpu ? `GPU ${activeGpuIndex}${gpuName ? ` · ${gpuName}` : ''}` : gpuName
+  const boxGpu = gpus[0]
+  const boxGpuIndex = gpuIndexOf(boxGpu)
+  // Multi-GPU hosts read per-GPU series via the `gpu:<idx>:<metric>` keys the
+  // history layer writes; single-GPU hosts use the plain metric keys.
+  const gpuMetricKey = (m: string) => (multiGpu ? `gpu:${boxGpuIndex}:${m}` : m)
 
-  // No hardware power cap is exposed on the GB10 (unified-memory SoC), so scale
-  // the gauge against the observed peak draw when the limit is absent.
-  const powerHistory = history.getChartData(gpuMetricKey('gpuPower'))
-  const powerPercent = computePowerScale(
-    activeGpu.power_watts,
-    activeGpu.power_limit_watts,
-    powerPeak(powerHistory, activeGpu.power_watts),
-  ).percent
+  const running = engines.filter((e) => e.status.type === 'Running' && e.metrics !== null)
+  const aggregate = aggregateEngines(running)
 
-  const memUsedPercent = metrics.memory.total_bytes > 0
-    ? (metrics.memory.used_bytes / metrics.memory.total_bytes) * 100
-    : 0
+  const readSeries = (key: string): DataPoint[] => history.getChartData(key)
+  const activeKey = !isAll && activeEngine ? engineKey(activeEngine) : ''
+  const eng = (seriesName: string): DataPoint[] => readSeries(`${activeKey}:${seriesName}`)
 
-  const gpuUsed = metrics.memory.gpu_estimated_bytes ?? 0
-  const cpuUsed = Math.max(0, metrics.memory.used_bytes - gpuUsed)
-  const cached = Math.min(metrics.memory.cached_bytes, metrics.memory.available_bytes)
-  const free = Math.max(0, metrics.memory.available_bytes - cached)
-  const totalGB = formatGiB(metrics.memory.display_total_bytes ?? metrics.memory.total_bytes)
+  // ---- Throughput ----
+  //
+  // PP: uncached prefill only. Every cell is a view of the same quantity —
+  // cache-miss tokens ÷ seconds spent prefilling them. `pp_5min` is the
+  // headline; `last_req_pp` is what the last completed request achieved
+  // (persists across idle); `pp_lifetime` folds all requests. Live-during-
+  // prefill is not exposed by this vLLM build so we do not fake it — the
+  // sparkline traces completion samples pushed onto the ring.
+  //
+  // TG: decode counter DOES tick per step in this build, so live tok/s is
+  // real and stays as the headline; `last_req_tg` adds a per-request view.
+  const ppMean = isAll ? aggregate.pp_5min : activeEngine?.metrics?.pp_5min
+  const ppLastReq = isAll ? aggregate.last_req_pp : activeEngine?.metrics?.last_req_pp
+  const ppLifetime = isAll ? aggregate.pp_lifetime : activeEngine?.metrics?.pp_lifetime
+  const ppTotal = isAll
+    ? aggregate.total_prompt_tokens
+    : activeEngine?.metrics?.total_prompt_tokens
+  const ppPure = isAll
+    ? aggregate.pure_prefill_tokens
+    : activeEngine?.metrics?.pure_prefill_tokens
 
-  const memorySegments: GaugeSegment[] = [
-    { value: gpuUsed, total: metrics.memory.total_bytes, color: '#76B900', label: `GPU: ${formatBytes(gpuUsed)}` },
-    { value: cpuUsed, total: metrics.memory.total_bytes, color: '#3B82F6', label: `CPU: ${formatBytes(cpuUsed)}` },
-    { value: cached, total: metrics.memory.total_bytes, color: '#71717A', label: `Cache: ${formatBytes(cached)}` },
-    { value: free, total: metrics.memory.total_bytes, color: '#27272A', label: `Free: ${formatBytes(free)}` },
-  ]
+  const tgMean = isAll
+    ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:tps`)), nowMs)
+    : activeWindowMean(eng('tps'), nowMs)
+  const tgNow = isAll ? aggregate.tokens_per_sec : activeEngine?.metrics?.tokens_per_sec
+  const tgPerReq = isAll
+    ? aggregate.per_request_tps
+    : activeEngine?.metrics?.per_request_tps
+  const tgLastReq = isAll ? aggregate.last_req_tg : activeEngine?.metrics?.last_req_tg
+  const tgTotal = isAll
+    ? aggregate.total_generation_tokens
+    : activeEngine?.metrics?.total_generation_tokens
 
-  // Un-indexed events apply to all GPUs; indexed events only to their GPU.
-  const activeGpuChartEvents = events
-    .filter(e => e.gpu_index === undefined || e.gpu_index === null || e.gpu_index === activeGpuIndex)
-    .map(e => ({ timestamp: e.timestamp_ms, type: e.event_type, detail: e.detail }))
-  const requestSpans = requests.map(r => ({
-    start: r.start_ms, end: r.end_ms, tps: r.tps, ttft: r.ttft_ms,
-  }))
+  const ppSeries = history.getPpChart?.(isAll ? undefined : activeKey) ?? []
+  const ppGreySeries = history.getPpGreyChart?.(isAll ? undefined : activeKey) ?? []
+  // Decode `tokens_per_sec` reads jitter: polls that land between token
+  // bursts see 0 even during a live block. Rolling mean over 5 samples so
+  // the trace reads as "block of decode", and hard-drop to 0 only when the
+  // trailing 3 samples are ALL zero — that's the "actually stopped" signal.
+  const tgRaw = isAll
+    ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:tps`)))
+    : sumConcurrentSeries([eng('tps')])
+  const tgSeries = tgRaw.map((p, i, arr) => {
+    const trailStart = Math.max(0, i - 2)
+    let allZero = true
+    for (let j = trailStart; j <= i; j++) {
+      if (arr[j].value > 0) { allZero = false; break }
+    }
+    if (allZero) return { ...p, value: 0 }
+    const start = Math.max(0, i - 4)
+    let sum = 0
+    let n = 0
+    for (let j = start; j <= i; j++) {
+      sum += arr[j].value
+      n++
+    }
+    return { ...p, value: sum / n }
+  })
 
-  // Compute totals as sum of two series, aligned by timestamp.
-  const sumSeries = (
-    a: Array<{ timestamp: number; value: number }>,
-    b: Array<{ timestamp: number; value: number }>,
-  ): Array<{ timestamp: number; value: number }> => {
-    const map = new Map<number, number>()
-    for (const p of a) map.set(p.timestamp, p.value)
-    for (const p of b) map.set(p.timestamp, (map.get(p.timestamp) ?? 0) + p.value)
-    return Array.from(map.entries())
-      .sort((x, y) => x[0] - y[0])
-      .map(([timestamp, value]) => ({ timestamp, value }))
+  const throughput = {
+    pp: {
+      badge: 'PP',
+      badgeColor: GOOD,
+      title: 'Prompt processing',
+      sub: 'uncached prefill · tokens/sec',
+      big: fmtOptional(ppMean),
+      big_sub: '5-min average',
+      last_req: fmtOptional(ppLastReq),
+      lifetime: fmtOptional(ppLifetime),
+      total: ppTotal == null ? '—' : formatCompactTokens(ppTotal),
+      total_label: 'Total (incl. cache)',
+      total2: ppPure == null ? '—' : formatCompactTokens(ppPure),
+      total2_label: 'Pure prefill',
+      series: ppSeries,
+      underlaySeries: ppGreySeries,
+      color: GOOD,
+    },
+    tg: {
+      badge: 'TG',
+      badgeColor: COOL,
+      title: 'Token generation',
+      sub: 'decode · tokens/sec',
+      big: fmtOptional(tgMean),
+      big_sub: '5-min average',
+      now: fmtOptional(tgNow),
+      per_req: fmtOptional(tgPerReq),
+      last_req: fmtOptional(tgLastReq),
+      total: tgTotal == null ? '—' : formatCompactTokens(tgTotal),
+      total_label: 'Total written',
+      series: tgSeries,
+      color: COOL,
+    },
   }
 
-  const diskRead = history.getChartData('diskRead')
-  const diskWrite = history.getChartData('diskWrite')
-  const diskTotal = sumSeries(diskRead, diskWrite)
-  const networkRx = history.getChartData('networkRx')
-  const networkTx = history.getChartData('networkTx')
-  const networkTotal = sumSeries(networkRx, networkTx)
+  // ---- Summary row ----
+  const memoryAvailable = metrics.memory.source_available
+  const availBytes = metrics.memory.available_bytes
+  const displayTotalBytes = metrics.memory.display_total_bytes ?? metrics.memory.total_bytes
+  const freeGB = availBytes / GIB
+  const totalGB = displayTotalBytes / GIB
+  const memColor = memoryAvailable ? memFreeColor(freeGB) : '#8b949d'
 
-  const DISK_READ_COLOR = '#76B900'
-  const DISK_WRITE_COLOR = '#F59E0B'
-  const TOTAL_COLOR = '#A1A1AA'
-  const NET_RX_COLOR = '#3B82F6'
-  const NET_TX_COLOR = '#A855F7'
+  const gpuTemp = boxGpu.temperature_celsius
+  const gpuPower = boxGpu.power_watts
+  const gpuStatus = gpuTemp == null
+    ? 'Telemetry unavailable'
+    : gpuTemp >= 85
+      ? 'Hot'
+      : gpuTemp >= 70
+        ? 'Warm'
+        : 'Nominal'
+
+  const queuedSum = isAll
+    ? aggregate.queued_requests
+    : activeEngine?.metrics?.queued_requests
+  const activeSum = isAll
+    ? aggregate.active_requests
+    : activeEngine?.metrics?.active_requests
+  const servedSum = isAll
+    ? aggregate.total_requests
+    : activeEngine?.metrics?.total_requests
+
+  // ---- Latency (cumulative engine histograms since the warmup baseline) ----
+  const ttftMs = isAll
+    ? aggregate.ttft_ms
+    : activeEngine?.metrics?.ttft_ms
+  const e2eMs = isAll
+    ? aggregate.e2e_latency_ms
+    : activeEngine?.metrics?.e2e_latency_ms
+  const itlMs = isAll
+    ? aggregate.inter_token_latency_ms
+    : activeEngine?.metrics?.inter_token_latency_ms
+  const tpotMs = isAll
+    ? aggregate.tpot_ms
+    : activeEngine?.metrics?.tpot_ms
+  const batch = isAll
+    ? aggregate.avg_batch_size
+    : activeEngine?.metrics?.avg_batch_size
+
+  const goodputSources = isAll
+    ? [
+        aggregate.ttft_goodput_pct,
+        aggregate.itl_goodput_pct,
+        aggregate.tpot_goodput_pct,
+        aggregate.e2e_goodput_pct,
+      ]
+    : [
+        activeEngine?.metrics?.ttft_goodput_pct,
+        activeEngine?.metrics?.itl_goodput_pct,
+        activeEngine?.metrics?.tpot_goodput_pct,
+        activeEngine?.metrics?.e2e_goodput_pct,
+      ]
+  const sloLabels = [
+    'First token under 0.5 s',
+    'Token gaps under 50 ms',
+    'Output tokens under 50 ms',
+    'Full answer under 5 s',
+  ] as const
+
+  // ---- Cache ----
+  const prefixHit = isAll
+    ? aggregate.prefix_cache_hit_rate
+    : activeEngine?.metrics?.prefix_cache_hit_rate
+  const kvCache = isAll
+    ? aggregate.kv_cache_percent
+    : activeEngine?.metrics?.kv_cache_percent
+  const prefixQueries = isAll
+    ? aggregate.prefix_cache_queries_total
+    : activeEngine?.metrics?.prefix_cache_queries_total
+
+  const specTar = isAll
+    ? aggregate.spec_decode_acceptance_rate
+    : activeEngine?.metrics?.spec_decode_acceptance_rate
+  const specAcceptLen = isAll
+    ? aggregate.spec_decode_mean_acceptance_length
+    : activeEngine?.metrics?.spec_decode_mean_acceptance_length
+  const specAccepted = isAll
+    ? aggregate.spec_decode_accepted_tokens_total
+    : activeEngine?.metrics?.spec_decode_accepted_tokens_total
+  const specDraft = isAll
+    ? aggregate.spec_decode_draft_tokens_total
+    : activeEngine?.metrics?.spec_decode_draft_tokens_total
+  const showSpec =
+    specTar !== null &&
+    specAcceptLen !== null &&
+    specAccepted !== null &&
+    specDraft !== null
+
+  // ---- Box divider hardware line ----
+  const hwParts = [
+    boxGpu.name ?? 'GPU',
+    metrics.cpu.name ?? 'CPU',
+    memoryAvailable ? `${formatGiB(displayTotalBytes)} unified` : 'memory unavailable',
+  ].filter((p) => p.length > 0)
+
+  // ---- Unified memory segments ----
+  const {
+    gpuBytes,
+    hostBytes,
+    cacheBytes,
+    reservedBytes,
+    freeBytes,
+    inUseBytes,
+  } = memoryBreakdown({
+    displayTotalBytes,
+    kernelTotalBytes: metrics.memory.total_bytes,
+    usedBytes: metrics.memory.used_bytes,
+    availableBytes: metrics.memory.available_bytes,
+    cachedBytes: metrics.memory.cached_bytes,
+    gpuEstimatedBytes: metrics.memory.gpu_estimated_bytes,
+  })
+  const memNote = !memoryAvailable
+    ? 'Telemetry unavailable'
+    : `${fmt(freeBytes / GIB)} GB kernel-available · ${fmt(reservedBytes / GIB)} GB hardware-reserved.`
+
+  const memorySegments: BarSegment[] = memoryAvailable ? [
+    { value: gpuBytes, total: displayTotalBytes, color: GOOD, label: 'GPU processes est.' },
+    { value: hostBytes, total: displayTotalBytes, color: COOL, label: 'Host used est.' },
+    {
+      value: cacheBytes,
+      total: displayTotalBytes,
+      color: 'oklch(0.72 0.10 285)',
+      label: 'Page cache',
+    },
+    { value: reservedBytes, total: displayTotalBytes, color: '#3a4046', label: 'Reserved' },
+  ] : []
+
+  // Per-core busiest % for the CPU card subtitle.
+  const coreMax = metrics.cpu.per_core.reduce((m, c) => Math.max(m, c.usage_percent), 0)
 
   return (
-    <div ref={rootRef} className="flex flex-col flex-1 min-h-0 gap-2">
-      {/* ── LLM Engines — auto-height, fits content; hardware fills remainder ── */}
-      <div className="shrink-0 min-h-0">
-        <EngineSection
-          engines={metrics.engines}
-          showCharts={showEngineCharts}
-          collapseCharts={collapseCharts}
-          onActiveEngineChange={onActiveEngineChange}
-          getChartData={history.getChartData}
-          requests={requests}
-          gpuCount={gpus.length}
-          onActiveEngineGpuChange={handleActiveEngineGpuChange}
-        />
+    <div className="flex flex-col min-w-0 gap-[clamp(10px,1vw,14px)]">
+      {/* ── Summary row ── */}
+      <div
+        className="flex flex-wrap"
+        style={{
+          background: '#1d2226',
+          border: '1px solid #1d2226',
+          borderRadius: '12px',
+          overflow: 'hidden',
+          gap: 1,
+        }}
+      >
+        <SummaryCell label="Memory free">
+          <div className="flex items-baseline gap-1.5">
+            <span
+              className="font-mono tabular-nums"
+              style={{
+                fontSize: 'clamp(22px, 2vw, 28px)',
+                fontWeight: 600,
+                letterSpacing: '-0.02em',
+                color: memColor,
+              }}
+            >
+              {memoryAvailable ? fmt(freeGB) : '—'}
+            </span>
+            <span style={{ fontSize: '12.5px', color: '#8b949d' }}>
+              {memoryAvailable ? `GB of ${fmtInt(totalGB)}` : 'GB'}
+            </span>
+          </div>
+        </SummaryCell>
+
+        <SummaryCell label="GPU temp">
+          <div className="flex items-baseline gap-1.5">
+            <span
+              className="font-mono tabular-nums"
+              style={{
+                fontSize: 'clamp(22px, 2vw, 28px)',
+                fontWeight: 600,
+                letterSpacing: '-0.02em',
+                color: gpuTemp == null ? '#8b949d' : gpuTempColor(gpuTemp),
+              }}
+            >
+              {gpuTemp == null ? '—' : fmtInt(gpuTemp)}
+            </span>
+            <span style={{ fontSize: '12.5px', color: '#8b949d' }}>
+              °C · {gpuPower == null ? '—' : fmtInt(gpuPower)} W
+            </span>
+          </div>
+          <div style={{ fontSize: '11.5px', color: '#8b949d' }}>{gpuStatus}</div>
+        </SummaryCell>
+
+        <SummaryCell label="Queue">
+          <div className="flex items-baseline gap-1.5">
+            <span
+              className="font-mono tabular-nums"
+              style={{
+                fontSize: 'clamp(22px, 2vw, 28px)',
+                fontWeight: 600,
+                letterSpacing: '-0.02em',
+                color: queuedSum == null ? '#8b949d' : queueColor(queuedSum),
+              }}
+            >
+              {fmtOptional(queuedSum)}
+            </span>
+            <span style={{ fontSize: '12.5px', color: '#8b949d' }}>waiting</span>
+          </div>
+          <div style={{ fontSize: '11.5px', color: '#8b949d' }}>{fmtOptional(activeSum)} in flight</div>
+        </SummaryCell>
+
+        <SummaryCell label="Served">
+          <div className="flex items-baseline gap-1.5">
+            <span
+              className="font-mono tabular-nums"
+              style={{ fontSize: 'clamp(22px, 2vw, 28px)', fontWeight: 600, letterSpacing: '-0.02em' }}
+            >
+              {fmtOptional(servedSum)}
+            </span>
+            <span style={{ fontSize: '12.5px', color: '#8b949d' }}>requests</span>
+          </div>
+        </SummaryCell>
       </div>
 
-      {/* ── Hardware Overview — fills the rest of the viewport ── */}
-      <div className="flex-1 min-h-0 bg-[#0a0a0d]/80 rounded-xl border border-white/[0.03] p-1 lg:p-1.5 2xl:p-2 flex flex-col">
-        {multiGpu && (
-          <div role="group" aria-label="GPU selector" className="shrink-0 grid grid-cols-2 lg:grid-cols-4 gap-1 lg:gap-1.5 mb-1 lg:mb-1.5">
-            {gpus.map((gpu) => {
-              const isActive = gpuIndexOf(gpu) === activeGpuIndex
-              return (
-                <button
-                  key={gpuIndexOf(gpu)}
-                  type="button"
-                  onClick={() => setSelectedGpuIndex(gpuIndexOf(gpu))}
-                  aria-pressed={isActive}
-                  className={`min-w-0 rounded-md border px-2 py-1 text-left cursor-pointer transition-colors duration-150 ${
-                    isActive
-                      ? 'border-[#76B900]/50 bg-[#76B900]/[0.06]'
-                      : 'border-white/[0.04] bg-[#151519] hover:border-white/[0.12]'
-                  }`}
+      {/* ── Throughput + Cache ── */}
+      <div className="flex flex-wrap gap-[clamp(10px,1vw,14px)]">
+        <ThroughputCard
+          badge={throughput.pp.badge}
+          badgeColor={throughput.pp.badgeColor}
+          title={throughput.pp.title}
+          sub={throughput.pp.sub}
+          big={throughput.pp.big}
+          bigSub={throughput.pp.big_sub}
+          feet={[
+            { label: 'Last Req', value: throughput.pp.last_req, unit: 'tok/s' },
+            { label: 'Lifetime', value: throughput.pp.lifetime, unit: 'tok/s' },
+            { label: throughput.pp.total_label, value: throughput.pp.total, unit: 'tok' },
+            { label: throughput.pp.total2_label, value: throughput.pp.total2, unit: 'tok' },
+          ]}
+          series={throughput.pp.series}
+          underlaySeries={throughput.pp.underlaySeries}
+          color={throughput.pp.color}
+          height={76}
+          nowMs={nowMs}
+          active={(activeSum ?? 0) > 0 && (tgNow ?? 0) < 1}
+        />
+        <ThroughputCard
+          badge={throughput.tg.badge}
+          badgeColor={throughput.tg.badgeColor}
+          title={throughput.tg.title}
+          sub={throughput.tg.sub}
+          big={throughput.tg.big}
+          bigSub={throughput.tg.big_sub}
+          feet={[
+            { label: 'Now', value: throughput.tg.now, unit: 'tok/s' },
+            { label: 'Last Req', value: throughput.tg.last_req, unit: 'tok/s' },
+            { label: 'Per request', value: throughput.tg.per_req, unit: 'tok/s' },
+            { label: throughput.tg.total_label, value: throughput.tg.total, unit: 'tok' },
+          ]}
+          series={throughput.tg.series}
+          color={throughput.tg.color}
+          height={76}
+          nowMs={nowMs}
+        />
+
+        {/* Cache */}
+        <div
+          className="flex flex-col min-w-0 min-h-0"
+          style={{
+            flex: '1 1 300px',
+            background: '#101214',
+            border: '1px solid #1d2226',
+            borderRadius: '16px',
+            padding: 'clamp(16px, 1.4vw, 22px)',
+            gap: '16px',
+          }}
+        >
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <span style={{ fontSize: '14px', fontWeight: 600 }}>Cache</span>
+            <span style={{ fontSize: '11.5px', color: '#78828c' }}>reuse over recompute</span>
+          </div>
+
+          <div className="flex items-center gap-[clamp(14px,1.6vw,22px)] flex-wrap">
+            <div className="relative shrink-0" style={{ width: '138px', height: '138px' }}>
+              <ArcGauge value={prefixHit ?? undefined} label="Prefix hit" unit="%" size={138} hideCenter />
+              <div
+                className="absolute inset-0 flex flex-col items-center justify-center"
+                style={{ gap: '1px' }}
+              >
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: '38px', fontWeight: 600, letterSpacing: '-0.03em' }}
                 >
-                  <div className="flex items-baseline justify-between gap-2 min-w-0">
-                    {/* The label deliberately does not normalize: a GPU the
-                        backend gave no index is shown as plain "GPU", not as
-                        "GPU 0" it may not be. */}
-                    <span className="text-[10px] lg:text-[11px] font-semibold text-zinc-200 truncate">
-                      {gpu.index !== null && gpu.index !== undefined ? `GPU ${gpu.index}` : 'GPU'}
+                  {prefixHit == null ? '—' : fmtInt(prefixHit)}
+                  <span style={{ fontSize: '17px', color: '#8b949d' }}>%</span>
+                </span>
+                <div
+                  className="uppercase"
+                  style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.1em', color: '#8b949d' }}
+                >
+                  Prefix hit
+                </div>
+              </div>
+            </div>
+
+            <div className="flex-1 min-w-0 min-h-0 flex flex-col gap-3">
+              <div className="flex flex-col gap-0.5">
+                <div
+                  className="uppercase"
+                  style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+                >
+                  Prefix lookups
+                </div>
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: '19px', fontWeight: 500, color: '#e7eaed' }}
+                >
+                  {prefixQueries == null ? '—' : formatCompactTokens(prefixQueries)}
+                </span>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <div className="flex justify-between items-baseline gap-2">
+                  <div
+                    className="uppercase"
+                    style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+                  >
+                    KV cache used
+                  </div>
+                  <span className="font-mono tabular-nums" style={{ fontSize: '13px', fontWeight: 500 }}>
+                    {kvCache == null ? '—' : fmtInt(kvCache)}%
+                  </span>
+                </div>
+                <div className="relative h-1 rounded overflow-hidden" style={{ background: '#20252a' }}>
+                  <div
+                    className="absolute inset-y-0 left-0"
+                    style={{ width: `${kvCache ?? 0}%`, background: COOL, borderRadius: '2px' }}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {showSpec && (
+            <div
+              className="flex flex-col"
+              style={{ borderTop: '1px solid #1d2226', paddingTop: '13px', gap: '9px' }}
+            >
+              <div
+                className="uppercase"
+                style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+              >
+                Speculative decoding
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <div className="flex flex-col gap-0.5">
+                  <span
+                    className="font-mono tabular-nums"
+                    style={{ fontSize: '18px', fontWeight: 500, color: tarColor(specTar ?? 0) }}
+                  >
+                    {fmtInt(specTar ?? 0)}%
+                  </span>
+                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>drafts accepted</span>
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  <span className="font-mono tabular-nums" style={{ fontSize: '18px', fontWeight: 500 }}>
+                    {Number(specAcceptLen ?? 0).toFixed(2)}
+                  </span>
+                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>tok per draft</span>
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  <span className="font-mono tabular-nums" style={{ fontSize: '18px', fontWeight: 500 }}>
+                    {formatCompactTokens(specAccepted ?? 0)}
+                    <span style={{ fontSize: '12px', color: '#8b949d' }}>
+                      {' / '}
+                      {formatCompactTokens(specDraft ?? 0)}
                     </span>
-                    <span className="text-[10px] text-zinc-500 truncate">{gpu.name}</span>
+                  </span>
+                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>accepted of drafted</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Requests strip (Active / Queued / Total) ── */}
+      <div
+        className="flex flex-wrap items-center gap-[clamp(12px,1.4vw,18px)]"
+        style={{
+          background: '#101214',
+          border: '1px solid #1d2226',
+          borderRadius: '16px',
+          padding: 'clamp(12px, 1.2vw, 18px)',
+        }}
+      >
+        <div className="flex items-center gap-2.5 shrink-0">
+          <span
+            className="inline-block shrink-0"
+            style={{
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: '11px',
+              fontWeight: 600,
+              color: WARN,
+              background: alpha(WARN, 0.13),
+              borderRadius: '5px',
+              padding: '3px 7px',
+            }}
+          >
+            REQ
+          </span>
+          <span style={{ fontSize: '14px', fontWeight: 600 }}>Requests</span>
+          <span style={{ fontSize: '11.5px', color: '#78828c' }}>active · queued · completed</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-[clamp(10px,1.2vw,16px)]" style={{ marginLeft: 'auto' }}>
+          <Foot
+            label="Active"
+            value={fmtInt((isAll ? aggregate.active_requests : activeEngine?.metrics?.active_requests) ?? null)}
+          />
+          <Foot
+            label="Queued"
+            value={fmtInt((isAll ? aggregate.queued_requests : activeEngine?.metrics?.queued_requests) ?? null)}
+          />
+          <Foot
+            label="Total"
+            value={fmtInt((isAll ? aggregate.total_requests : activeEngine?.metrics?.total_requests) ?? null)}
+          />
+          <Sparkline
+            width={180}
+            height={44}
+            series={[
+              {
+                data: sumConcurrentSeries(
+                  isAll
+                    ? running.map((e) => readSeries(`${engineKey(e)}:totalRequests`))
+                    : [eng('totalRequests')],
+                ).map((p) => p.value),
+                color: '#8b949d',
+              },
+              {
+                data: sumConcurrentSeries(
+                  isAll
+                    ? running.map((e) => readSeries(`${engineKey(e)}:queuedRequests`))
+                    : [eng('queuedRequests')],
+                ).map((p) => p.value),
+                color: WARN,
+              },
+              {
+                // Active last: later series paint on top, and green must stay
+                // visible where it overlaps the others at the floor.
+                data: sumConcurrentSeries(
+                  isAll
+                    ? running.map((e) => readSeries(`${engineKey(e)}:activeRequests`))
+                    : [eng('activeRequests')],
+                ).map((p) => p.value),
+                color: GOOD,
+              },
+            ]}
+          />
+        </div>
+      </div>
+
+      {/* ── Per model (All tab only) ── */}
+      {isAll && (
+        <div
+          className="flex flex-col min-w-0 min-h-0"
+          style={{
+            background: '#101214',
+            border: '1px solid #1d2226',
+            borderRadius: '16px',
+            padding: 'clamp(16px, 1.4vw, 22px)',
+            gap: '14px',
+          }}
+        >
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <span style={{ fontSize: '14px', fontWeight: 600 }}>Per model</span>
+            <span style={{ fontSize: '11.5px', color: '#78828c' }}>
+               both models share one {boxGpu.name ?? 'GB'} and its {memoryAvailable ? fmtInt(totalGB) : '—'} GB
+            </span>
+          </div>
+          <div className="flex flex-col gap-3">
+            {engines.map((engine) => {
+              const key = engineKey(engine)
+              const stopped = engine.metrics === null
+              if (stopped) {
+                return (
+                  <div
+                    key={key}
+                    className="flex flex-wrap items-center opacity-40"
+                    style={{
+                      background: '#141719',
+                      border: '1px solid #1d2226',
+                      borderRadius: '12px',
+                      padding: '15px 18px',
+                      gap: '14px 22px',
+                    }}
+                  >
+                    <Col label="PP" value={<MonoBig>—</MonoBig>} />
+                    <Col label="TG" value={<MonoBig>—</MonoBig>} />
+                    <Col label="First tok" value={<MonoBig>—</MonoBig>} />
+                    <Col label="Cache hit" value={<MonoBig>—</MonoBig>} />
+                    <Col label="In flight" value={<MonoBig>—</MonoBig>} />
                   </div>
-                  <div className="mt-0.5 grid grid-cols-3 gap-2 text-[10px] lg:text-[11px] font-mono tabular-nums text-zinc-300">
-                    <span>{gpu.utilization_percent ?? 0}%</span>
-                    <span>{gpu.temperature_celsius ?? 0}C</span>
-                    <span>{gpu.power_watts !== null ? `${Math.round(gpu.power_watts)}W` : '--'}</span>
-                  </div>
-                </button>
+                )
+              }
+              const metaParts = [
+                engine.model?.parameter_size,
+                engine.model?.quantization,
+                engine.model?.precision,
+                engine.model?.pipeline_tag,
+              ].filter((p): p is string => p != null && p.length > 0)
+              const ppMeanE = activeWindowMean(readSeries(`${key}:promptTps`), nowMs)
+              const tgMeanE = activeWindowMean(readSeries(`${key}:tps`), nowMs)
+              const ttftE = engine.metrics!.ttft_ms
+              return (
+                <ModelRow
+                  key={key}
+                  name={engineDisplayOverride(engine) ?? engine.model?.name ?? key}
+                  meta={metaParts.join(' · ')}
+                  pp={fmtOptional(ppMeanE)}
+                  tg={fmtOptional(tgMeanE)}
+                  ttft={ttftE == null ? '—' : fmtSeconds(ttftE)}
+                  ttftColor={ttftE == null ? '#8b949d' : firstTokColor(ttftE)}
+                  hit={fmtInt(engine.metrics!.prefix_cache_hit_rate)}
+                  active={fmtInt(engine.metrics!.active_requests)}
+                  queued={fmtInt(engine.metrics!.queued_requests)}
+                  series={sumConcurrentSeries([readSeries(`${key}:tps`)])}
+                  color={engine === engines[0] ? GOOD : COOL}
+                  onSelect={() => onActiveTabChange(key)}
+                  nowMs={nowMs}
+                />
               )
             })}
           </div>
-        )}
+        </div>
+      )}
 
-        <div ref={hwGridRef} className="flex-1 min-h-0 grid grid-cols-2 sm:grid-cols-4 gap-1 lg:gap-1.5 auto-rows-fr">
+      {/* ── Latency ── */}
+      <div className="flex flex-wrap gap-[clamp(10px,1vw,14px)]">
+        {/* Latency */}
+        <div
+          className="flex flex-col min-w-0 min-h-0"
+          style={{
+            flex: '2 1 430px',
+            background: '#101214',
+            border: '1px solid #1d2226',
+            borderRadius: '16px',
+            padding: 'clamp(16px, 1.4vw, 22px)',
+            gap: '16px',
+          }}
+        >
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <span style={{ fontSize: '14px', fontWeight: 600 }}>Latency</span>
+            <span style={{ fontSize: '11.5px', color: '#78828c' }}>
+              lifetime average · {isAll ? 'weighted across both models' : 'this model'}
+            </span>
+          </div>
 
-          {/* GPU Utilization */}
-          <HwCard title="GPU Utilization" subtitle={gpuSubtitle}>
-            {compact ? (
-              <HBar value={activeGpu.utilization_percent ?? 0} label="GPU Util" unit="%" />
-            ) : (
-              <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <ArcGauge value={activeGpu.utilization_percent ?? 0} label="GPU Util" unit="%" size={HW_GAUGE_PX} />
-                <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={history.getChartData(gpuMetricKey('gpuUtil'))} yDomain={[0, 100]} unit="%" events={activeGpuChartEvents} requests={requestSpans} height={HW_CHART_HEIGHT} />
-                </div>
-              </div>
-            )}
-          </HwCard>
+          <div className="flex flex-wrap gap-[18px 30px]">
+            <LatCol
+              label="First token"
+              hint="wait before anything appears"
+              value={
+                <span style={{ color: ttftMs == null ? '#8b949d' : firstTokColor(ttftMs) }}>
+                  <span
+                    className="font-mono tabular-nums"
+                    style={{
+                      fontSize: 'clamp(32px, 3.4vw, 46px)',
+                      fontWeight: 600,
+                      letterSpacing: '-0.03em',
+                      lineHeight: 1,
+                    }}
+                  >
+                    {ttftMs == null ? '—' : fmtSeconds(ttftMs)}
+                  </span>
+                  <span style={{ fontSize: '16px', color: '#8b949d', fontWeight: 400 }}> s</span>
+                </span>
+              }
+            />
+            <LatCol
+              label="Whole answer"
+              hint="start to last token"
+              value={
+                <span style={{ color: e2eMs == null ? '#8b949d' : wholeAnswerColor(e2eMs) }}>
+                  <span
+                    className="font-mono tabular-nums"
+                    style={{
+                      fontSize: 'clamp(28px, 2.8vw, 36px)',
+                      fontWeight: 600,
+                      letterSpacing: '-0.03em',
+                      lineHeight: 1,
+                    }}
+                  >
+                    {e2eMs == null ? '—' : fmtSeconds(e2eMs)}
+                  </span>
+                  <span style={{ fontSize: '14px', color: '#8b949d', fontWeight: 400 }}> s</span>
+                </span>
+              }
+            />
+            <LatCol
+              label="Between tokens"
+              hint="gap the reader sees"
+              value={
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: '22px', fontWeight: 500, lineHeight: 1 }}
+                >
+                  {itlMs == null ? '—' : fmtInt(itlMs)}
+                  <span style={{ fontSize: '12px', color: '#8b949d' }}> ms</span>
+                </span>
+              }
+            />
+            <LatCol
+              label="Per output token"
+              hint={batch == null ? 'batch unavailable' : `batch of ${batch.toFixed(1)} per step`}
+              value={
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: '22px', fontWeight: 500, lineHeight: 1 }}
+                >
+                  {tpotMs == null ? '—' : fmtInt(tpotMs)}
+                  <span style={{ fontSize: '12px', color: '#8b949d' }}> ms</span>
+                </span>
+              }
+            />
+          </div>
 
-          {/* GPU Temperature */}
-          <HwCard title="GPU Temp" subtitle={gpuSubtitle}>
-            {compact ? (
-              <HBar value={activeGpu.temperature_celsius ?? 0} label="GPU Temp" unit="°C" thresholds={THRESHOLDS.gpuTemp} />
-            ) : (
-              <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <ArcGauge value={activeGpu.temperature_celsius ?? 0} label="GPU Temp" unit="°C" thresholds={THRESHOLDS.gpuTemp} size={HW_GAUGE_PX} />
-                <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={history.getChartData(gpuMetricKey('gpuTemp'))} yDomain={[0, 100]} unit="°C" height={HW_CHART_HEIGHT} />
-                </div>
-              </div>
-            )}
-          </HwCard>
+          <div className="relative" style={{ height: '54px', margin: '0 -6px' }}>
+            <AreaSparkline
+              data={
+                isAll
+                  ? weightedSeries(running.map((e) => ({
+                      values: readSeries(`${engineKey(e)}:ttft`),
+                      weights: readSeries(`${engineKey(e)}:ttftObservations`),
+                    })))
+                  : readSeries(`${activeKey}:ttft`)
+              }
+              color={ttftMs != null && ttftMs > 2000 ? '#ef4444' : GOOD}
+              height={54}
+              nowMs={nowMs}
+            />
+          </div>
 
-          {/* GPU Power */}
-          <HwCard title="GPU Power" subtitle={gpuSubtitle}>
-            {compact ? (
-              <HBar
-                value={powerPercent}
-                label="GPU Power"
-                unit="W"
-                thresholds={THRESHOLDS.gpuPower}
-                displayValue={activeGpu.power_watts !== null ? Math.round(activeGpu.power_watts) : 0}
+          <div
+            className="flex flex-col"
+            style={{ borderTop: '1px solid #1d2226', paddingTop: '13px', gap: '9px' }}
+          >
+            <div
+              className="uppercase"
+              style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+            >
+              Requests meeting each target
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {sloLabels.map((label, i) => {
+                const pct = goodputSources[i] ?? null
+                const color = pct == null ? '#8b949d' : goodputColor(pct)
+                return (
+                  <GoodputChip
+                    key={label}
+                    label={label}
+                    pct={pct}
+                    color={color}
+                  />
+                )
+              })}
+            </div>
+          </div>
+
+          <div className="flex justify-end">
+            <SloSettingsControl
+              thresholds={slo.thresholds}
+              isCustomized={slo.isCustomized}
+              disabled={isAll}
+              onChange={slo.setThresholds}
+              onReset={slo.reset}
+            />
+          </div>
+        </div>
+
+      </div>
+
+      {/* ── THE BOX divider ── */}
+      <div className="flex items-baseline gap-2.5 px-0.5">
+        <span
+          className="uppercase"
+          style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '.13em', color: '#8b949d' }}
+        >
+          The box
+        </span>
+        <div className="flex-1 h-0.5" style={{ background: '#1d2226' }} />
+        <span className="font-mono shrink-0" style={{ fontSize: '11px', color: '#5b646e' }}>
+          {hwParts.join(' · ')}
+        </span>
+      </div>
+
+      {/* ── Box row ── */}
+      <div className="flex flex-wrap gap-[clamp(10px,1vw,14px)]">
+        {/* GPU load */}
+        <div
+          className="flex flex-col min-w-0 min-h-0"
+          style={{
+            flex: '1 1 320px',
+            background: '#101214',
+            border: '1px solid #1d2226',
+            borderRadius: '16px',
+            padding: 'clamp(16px, 1.4vw, 22px)',
+            gap: '15px',
+          }}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span style={{ fontSize: '14px', fontWeight: 600 }}>GPU load</span>
+            <span className="font-mono shrink-0" style={{ fontSize: '11px', color: '#5b646e' }}>
+              {boxGpu.name ?? 'GB10'}
+            </span>
+          </div>
+          <div className="flex items-center gap-[clamp(12px,1.4vw,20px)] flex-wrap">
+            <div className="relative shrink-0" style={{ width: '132px', height: '132px' }}>
+              <ArcGauge
+                value={boxGpu.utilization_percent ?? undefined}
+                label="GPU Util"
+                unit="%"
+                size={132}
+                hideCenter
               />
-            ) : (
-              <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <ArcGauge
-                  value={powerPercent}
-                  label="GPU Power"
-                  unit="W"
-                  thresholds={THRESHOLDS.gpuPower}
-                  displayValue={activeGpu.power_watts !== null ? Math.round(activeGpu.power_watts) : 0}
-                  size={HW_GAUGE_PX}
-                />
-                <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={powerHistory} unit="W" height={HW_CHART_HEIGHT} />
-                </div>
-              </div>
-            )}
-          </HwCard>
-
-          {/* GPU Clock */}
-          <HwCard title="GPU Clock" subtitle={gpuSubtitle}>
-            {compact ? (
-              <div className="flex items-baseline justify-between gap-2 min-w-0">
-                <span className="text-[9px] lg:text-[10px] text-zinc-400 uppercase tracking-wider truncate">Graphics</span>
-                <span className="ml-auto shrink-0 text-xs lg:text-sm 2xl:text-base font-bold text-zinc-100 font-mono tabular-nums">{formatMhz(activeGpu.clock_graphics_mhz)}</span>
-              </div>
-            ) : (
-              <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <div className="flex flex-col items-center justify-center shrink-0" style={{ width: HW_GAUGE_PX, height: HW_GAUGE_PX }}>
-                  <span className="text-sm 2xl:text-base min-[1920px]:text-lg font-bold text-zinc-100 font-mono">{formatMhz(activeGpu.clock_graphics_mhz)}</span>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={history.getChartData(gpuMetricKey('gpuClockGraphics'))} unit="MHz" height={HW_CHART_HEIGHT} />
-                </div>
-              </div>
-            )}
-          </HwCard>
-
-          {/* CPU */}
-          <HwCard title="CPU" subtitle={metrics.cpu.name ?? undefined}>
-            {compact ? (
-              <HBar value={metrics.cpu.aggregate_percent} label="CPU" unit="%" thresholds={THRESHOLDS.cpuUsage} />
-            ) : (
-              <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <ArcGauge value={metrics.cpu.aggregate_percent} label="CPU" unit="%" thresholds={THRESHOLDS.cpuUsage} size={HW_GAUGE_PX} />
-                <div className="flex-1 min-w-0">
-                  <TimeSeriesChart data={history.getChartData('cpuAggregate')} yDomain={[0, 100]} unit="%" height={HW_CHART_HEIGHT} />
-                </div>
-              </div>
-            )}
-            {!compact && metrics.cpu.per_core.length > 0 && <CoreHeatmap cores={metrics.cpu.per_core} />}
-          </HwCard>
-
-          {/* Memory */}
-          <HwCard title="Memory" subtitle={`${totalGB} Unified`}>
-            {compact ? (
-              <HBar value={memUsedPercent} label="" unit="%" segments={memorySegments} />
-            ) : (
-              <div className="flex items-center justify-center min-h-0 flex-1 overflow-hidden">
-                <ArcGauge value={memUsedPercent} label="" unit="%" segments={memorySegments} size={HW_GAUGE_PX} />
-              </div>
-            )}
-          </HwCard>
-
-          {/* Disk I/O */}
-          <HwCard title="Disk I/O" subtitle={metrics.disk.name ?? undefined}>
-            {compact ? (
-              <div className="flex items-baseline justify-between gap-2 min-w-0 font-mono">
-                <span className="flex items-baseline gap-1 min-w-0">
-                  <span className="text-[9px] lg:text-[10px] text-zinc-500">R</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.disk.read_bytes_per_sec)}</span>
-                </span>
-                <span className="flex items-baseline gap-1 min-w-0">
-                  <span className="text-[9px] lg:text-[10px] text-zinc-500">W</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.disk.write_bytes_per_sec)}</span>
+              <div className="absolute inset-0 flex items-center justify-center" style={{ gap: '1px' }}>
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: 'clamp(34px, 3.2vw, 42px)', fontWeight: 600, letterSpacing: '-0.03em' }}
+                >
+                  {boxGpu.utilization_percent == null ? '—' : fmtInt(boxGpu.utilization_percent)}
+                  <span style={{ fontSize: '17px', color: '#8b949d' }}>%</span>
                 </span>
               </div>
-            ) : (
-              <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <div className="flex flex-col items-center justify-center gap-0.5 shrink-0" style={{ width: HW_GAUGE_PX, height: HW_GAUGE_PX }}>
-                  <div className="flex items-baseline gap-1">
-                    <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">R</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.disk.read_bytes_per_sec)}</span>
-                  </div>
-                  <div className="flex items-baseline gap-1">
-                    <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">W</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.disk.write_bytes_per_sec)}</span>
-                  </div>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <TimeSeriesChart
-                    series={[
-                      { data: diskTotal, label: 'Total', color: TOTAL_COLOR },
-                      { data: diskRead, label: 'Read', color: DISK_READ_COLOR },
-                      { data: diskWrite, label: 'Write', color: DISK_WRITE_COLOR },
-                    ]}
-                    unit="B/s"
-                    height={HW_CHART_HEIGHT}
+            </div>
+            <div className="flex-1 min-w-0 min-h-0" style={{ height: '88px' }}>
+              <AreaSparkline data={readSeries(gpuMetricKey('gpuUtil'))} color={GOOD} height={88} nowMs={nowMs} />
+            </div>
+          </div>
+          <div
+            className="flex flex-wrap"
+            style={{ gap: '12px 22px', borderTop: '1px solid #1d2226', paddingTop: '13px' }}
+          >
+            <Foot
+              label="temp"
+              value={
+                <>
+                  <span style={{ color: gpuTemp == null ? '#8b949d' : gpuTempColor(gpuTemp) }}>
+                    {gpuTemp == null ? '—' : fmtInt(gpuTemp)}
+                    <span style={{ fontSize: '11px', color: '#8b949d' }}> °C</span>
+                  </span>
+                </>
+              }
+            />
+            <Foot
+              label="power"
+              value={
+                <>
+                  {gpuPower == null ? '—' : fmtInt(gpuPower)}
+                  <span style={{ fontSize: '11px', color: '#8b949d' }}> W</span>
+                </>
+              }
+            />
+            <Foot
+              label="clock"
+              value={
+                <>
+                  {formatMhz(boxGpu.clock_graphics_mhz)}
+                </>
+              }
+            />
+          </div>
+        </div>
+
+        {/* CPU load */}
+        <div
+          className="flex flex-col min-w-0 min-h-0"
+          style={{
+            flex: '1 1 320px',
+            background: '#101214',
+            border: '1px solid #1d2226',
+            borderRadius: '16px',
+            padding: 'clamp(16px, 1.4vw, 22px)',
+            gap: '15px',
+          }}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span style={{ fontSize: '14px', fontWeight: 600 }}>CPU load</span>
+            <span className="font-mono shrink-0" style={{ fontSize: '11px', color: '#5b646e' }}>
+              busiest core {fmtInt(coreMax)}%
+            </span>
+          </div>
+          <div className="flex items-center gap-[clamp(12px,1.4vw,20px)] flex-wrap">
+            <div className="relative shrink-0" style={{ width: '132px', height: '132px' }}>
+              <ArcGauge
+                value={metrics.cpu.aggregate_percent}
+                label="CPU Util"
+                unit="%"
+                thresholds={THRESHOLDS.cpuUsage}
+                size={132}
+                hideCenter
+              />
+              <div className="absolute inset-0 flex items-center justify-center" style={{ gap: '1px' }}>
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: 'clamp(34px, 3.2vw, 42px)', fontWeight: 600, letterSpacing: '-0.03em' }}
+                >
+                  {fmtInt(metrics.cpu.aggregate_percent)}
+                  <span style={{ fontSize: '17px', color: '#8b949d' }}>%</span>
+                </span>
+              </div>
+            </div>
+            <div className="flex-1 min-w-0 min-h-0" style={{ height: '88px' }}>
+              <AreaSparkline data={readSeries('cpuAggregate')} color={COOL} height={88} nowMs={nowMs} />
+            </div>
+          </div>
+          <div className="flex flex-col" style={{ gap: '8px' }}>
+            <div
+              className="uppercase"
+              style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+            >
+              Per core
+            </div>
+            <CoreHeatmap cores={metrics.cpu.per_core} />
+          </div>
+        </div>
+
+        {/* Unified memory */}
+        <div
+          className="flex flex-col min-w-0 min-h-0"
+          style={{
+            flex: '1.3 1 340px',
+            background: '#101214',
+            border: '1px solid #1d2226',
+            borderRadius: '16px',
+            padding: 'clamp(16px, 1.4vw, 22px)',
+            gap: '15px',
+          }}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span style={{ fontSize: '14px', fontWeight: 600 }}>Unified memory</span>
+            <span className="font-mono shrink-0" style={{ fontSize: '11px', color: '#5b646e' }}>
+              {memoryAvailable ? fmtInt(totalGB) : '—'} GB shared
+            </span>
+          </div>
+
+          <div className="flex items-end gap-2.5 flex-wrap">
+            <span
+              className="font-mono tabular-nums shrink-0"
+              style={{
+                fontSize: 'clamp(40px, 4.2vw, 58px)',
+                fontWeight: 600,
+                letterSpacing: '-0.04em',
+                lineHeight: 0.9,
+                color: memFreeColor(freeBytes / GIB),
+              }}
+            >
+              {memoryAvailable ? fmt(freeBytes / GIB) : '—'}
+            </span>
+            <div className="flex flex-col gap-0.5 pb-1">
+              <div style={{ fontSize: '15px', color: '#8b949d' }}>GB free</div>
+              <div style={{ fontSize: '11.5px', color: '#78828c' }}>
+                {memoryAvailable ? `${fmt(inUseBytes / GIB)} GB in use` : 'Telemetry unavailable'}
+              </div>
+            </div>
+          </div>
+
+          <StackedBar segments={memorySegments} />
+
+          <div className="flex flex-wrap gap-3">
+            {memorySegments.map((seg) => (
+              <div key={seg.label} className="flex flex-col gap-0.5">
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className="inline-block shrink-0"
+                    style={{ width: '7px', height: '7px', borderRadius: '2px', backgroundColor: seg.color }}
                   />
+                  <span style={{ fontSize: '11px', color: '#78828c' }}>{seg.label}</span>
                 </div>
-              </div>
-            )}
-          </HwCard>
-
-          {/* Network I/O */}
-          <HwCard title="Network" subtitle={metrics.network.name ?? undefined}>
-            {compact ? (
-              <div className="flex items-baseline justify-between gap-2 min-w-0 font-mono">
-                <span className="flex items-baseline gap-1 min-w-0">
-                  <span className="text-[9px] lg:text-[10px] text-zinc-500">RX</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.network.rx_bytes_per_sec)}</span>
-                </span>
-                <span className="flex items-baseline gap-1 min-w-0">
-                  <span className="text-[9px] lg:text-[10px] text-zinc-500">TX</span>
-                  <span className="text-xs lg:text-sm font-bold text-zinc-100 tabular-nums truncate">{formatRate(metrics.network.tx_bytes_per_sec)}</span>
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: '17px', fontWeight: 500, color: '#e7eaed' }}
+                >
+                  {fmt(seg.value / GIB)}
+                  <span style={{ fontSize: '11px', color: '#8b949d' }}> GB</span>
                 </span>
               </div>
-            ) : (
-              <div className="flex items-center gap-2 min-w-0 min-h-0 flex-1 overflow-hidden">
-                <div className="flex flex-col items-center justify-center gap-0.5 shrink-0" style={{ width: HW_GAUGE_PX, height: HW_GAUGE_PX }}>
-                  <div className="flex items-baseline gap-1">
-                    <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">RX</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.network.rx_bytes_per_sec)}</span>
-                  </div>
-                  <div className="flex items-baseline gap-1">
-                    <span className="text-[9px] 2xl:text-[10px] min-[1920px]:text-xs text-zinc-500">TX</span>
-                    <span className="text-xs 2xl:text-sm min-[1920px]:text-base font-bold text-zinc-100 font-mono">{formatRate(metrics.network.tx_bytes_per_sec)}</span>
-                  </div>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <TimeSeriesChart
-                    series={[
-                      { data: networkTotal, label: 'Total', color: TOTAL_COLOR },
-                      { data: networkRx, label: 'RX', color: NET_RX_COLOR },
-                      { data: networkTx, label: 'TX', color: NET_TX_COLOR },
-                    ]}
-                    unit="B/s"
-                    height={HW_CHART_HEIGHT}
-                  />
-                </div>
-              </div>
-            )}
-          </HwCard>
+            ))}
+          </div>
 
+          <div
+            className="text-wrap"
+            style={{ borderTop: '1px solid #1d2226', paddingTop: '12px', fontSize: '11.5px', color: '#78828c' }}
+          >
+            {memNote}
+          </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** A latency metric block: label, big value, and a hint line. */
+function LatCol({
+  label,
+  hint,
+  value,
+}: {
+  label: string
+  hint: string
+  value: React.ReactNode
+}) {
+  return (
+    <div className="flex flex-col gap-1" style={{ flex: '1 1 150px', minWidth: 0 }}>
+      <div
+        className="uppercase"
+        style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+      >
+        {label}
+      </div>
+      {value}
+      <div style={{ fontSize: '11.5px', color: '#78828c' }}>{hint}</div>
     </div>
   )
 }

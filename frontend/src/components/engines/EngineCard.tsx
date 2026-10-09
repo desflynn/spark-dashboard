@@ -44,14 +44,14 @@ function decodeTokenSeries(chartData: {
 }
 
 function prefillTokenSeries(chartData: {
-  promptTps: ChartDataPoint[]
-  avgPromptTps: ChartDataPoint[]
-  perReqPromptTps: ChartDataPoint[]
+  ppLastReq: ChartDataPoint[]
+  pp5min: ChartDataPoint[]
+  ppLifetime: ChartDataPoint[]
 }): ChartSeries[] {
   return [
-    { data: chartData.promptTps, label: 'Live', color: '#76B900' },
-    { data: chartData.avgPromptTps, label: 'Avg', color: '#3b82f6' },
-    { data: chartData.perReqPromptTps, label: 'Per-req', color: '#a855f7' },
+    { data: chartData.ppLastReq, label: 'Last Req', color: '#76B900' },
+    { data: chartData.pp5min, label: '5-min', color: '#3b82f6' },
+    { data: chartData.ppLifetime, label: 'Lifetime', color: '#a855f7' },
   ]
 }
 
@@ -70,9 +70,10 @@ interface EngineCardProps {
     kv: ChartDataPoint[]
     prefixCacheHit: ChartDataPoint[]
     e2eLatency: ChartDataPoint[]
-    promptTps: ChartDataPoint[]
-    avgPromptTps: ChartDataPoint[]
-    perReqPromptTps: ChartDataPoint[]
+    ppLastReq: ChartDataPoint[]
+    pp5min: ChartDataPoint[]
+    ppLifetime: ChartDataPoint[]
+    tgLastReq: ChartDataPoint[]
     queueTime: ChartDataPoint[]
     interTokenLatency: ChartDataPoint[]
     batchSize: ChartDataPoint[]
@@ -116,9 +117,9 @@ export function EngineCard({
   const tps = v('tokens_per_sec')
   const avgTps = v('avg_tokens_per_sec')
   const perReqTps = v('per_request_tps')
-  const promptTps = v('prompt_tokens_per_sec')
-  const avgPromptTps = v('avg_prompt_tokens_per_sec')
-  const perReqPromptTps = v('per_request_prompt_tps')
+  const ppLastReq = v('last_req_pp')
+  const pp5min = v('pp_5min')
+  const ppLifetime = v('pp_lifetime')
   const totalPromptTokens = v('total_prompt_tokens')
   const totalGenerationTokens = v('total_generation_tokens')
   const ttft = v('ttft_ms')
@@ -182,9 +183,9 @@ export function EngineCard({
   const tpsTrend: Trend = chartData ? computeTrend(chartData.tps) : 'stable'
   const avgTpsTrend: Trend = chartData ? computeTrend(chartData.avgTps) : 'stable'
   const perReqTpsTrend: Trend = chartData ? computeTrend(chartData.perReqTps) : 'stable'
-  const promptTpsTrend: Trend = chartData ? computeTrend(chartData.promptTps) : 'stable'
-  const avgPromptTpsTrend: Trend = chartData ? computeTrend(chartData.avgPromptTps) : 'stable'
-  const perReqPromptTpsTrend: Trend = chartData ? computeTrend(chartData.perReqPromptTps) : 'stable'
+  const ppLastReqTrend: Trend = chartData ? computeTrend(chartData.ppLastReq) : 'stable'
+  const pp5minTrend: Trend = chartData ? computeTrend(chartData.pp5min) : 'stable'
+  const ppLifetimeTrend: Trend = chartData ? computeTrend(chartData.ppLifetime) : 'stable'
   const ttftSeries = chartData
     ? (latencyMode === 'p50' ? chartData.ttftP50
        : latencyMode === 'p95' ? chartData.ttftP95
@@ -233,9 +234,9 @@ export function EngineCard({
             <div className="bg-white/[0.02] rounded-md px-3 py-2.5 2xl:px-4 2xl:py-3 min-w-0">
               <div className="text-[11px] 2xl:text-xs min-[1920px]:text-sm font-semibold text-zinc-300 tracking-tight mb-1.5 truncate">Prompt Processing / Prefill Throughput</div>
               <div className="grid grid-cols-1 gap-1.5">
-                <LiveWithTotal liveValue={fmtVal(promptTps, formatTps)} liveUnit="tok/s" trend={promptTpsTrend} totalLabel="Processed" total={totalPromptTokens} />
-                <MetricTile label="Avg" value={fmtVal(avgPromptTps, formatTps)} unit="tok/s" trend={avgPromptTpsTrend} />
-                <MetricTile label="Per-Req Avg" value={fmtVal(perReqPromptTps, formatTps)} unit="tok/s" trend={perReqPromptTpsTrend} />
+                <LiveWithTotal liveValue={fmtVal(ppLastReq, formatTps)} liveUnit="tok/s" trend={ppLastReqTrend} totalLabel="Total (incl. cache)" total={totalPromptTokens} />
+                <MetricTile label="5-min" value={fmtVal(pp5min, formatTps)} unit="tok/s" trend={pp5minTrend} />
+                <MetricTile label="Lifetime" value={fmtVal(ppLifetime, formatTps)} unit="tok/s" trend={ppLifetimeTrend} />
               </div>
             </div>
 

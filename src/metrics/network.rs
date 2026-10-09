@@ -1,5 +1,6 @@
 use crate::metrics::NetworkMetrics;
 use std::net::IpAddr;
+use std::time::Duration;
 
 /// Interface prefixes/names that are virtual (loopback, containers, VPNs, bridges).
 /// Physical / Wi-Fi names (`en*`, `eth*`, `wl*`, `wlan*`, `ww*`, `ib*`) are intentionally
@@ -65,7 +66,7 @@ fn is_global_ip(addr: &IpAddr) -> bool {
 
 /// Collect aggregate network I/O throughput metrics from sysinfo Networks.
 /// Since we refresh every ~1 second, the delta values approximate bytes/sec.
-pub fn collect_network_metrics(networks: &sysinfo::Networks) -> NetworkMetrics {
+pub fn collect_network_metrics(networks: &sysinfo::Networks, elapsed: Duration) -> NetworkMetrics {
     let interfaces: Vec<InterfaceInfo> = networks
         .iter()
         .map(|(iface, data)| InterfaceInfo {
@@ -77,7 +78,10 @@ pub fn collect_network_metrics(networks: &sysinfo::Networks) -> NetworkMetrics {
         })
         .collect();
 
-    select_network_metrics(&interfaces)
+    let mut metrics = select_network_metrics(&interfaces);
+    metrics.rx_bytes_per_sec = crate::metrics::per_second(metrics.rx_bytes_per_sec, elapsed);
+    metrics.tx_bytes_per_sec = crate::metrics::per_second(metrics.tx_bytes_per_sec, elapsed);
+    metrics
 }
 
 /// Pick the primary interface name and scope rx/tx totals to real (non-virtual)
@@ -247,7 +251,7 @@ mod tests {
     #[test]
     fn collect_network_metrics_with_fresh_networks_returns_zero_or_valid() {
         let networks = sysinfo::Networks::new_with_refreshed_list();
-        let metrics = collect_network_metrics(&networks);
+        let metrics = collect_network_metrics(&networks, Duration::from_secs(1));
         // First reading returns delta since process start, should be finite.
         assert!(metrics.rx_bytes_per_sec < u64::MAX);
         assert!(metrics.tx_bytes_per_sec < u64::MAX);

@@ -6,8 +6,17 @@ pub mod memory;
 pub mod network;
 
 use crate::engines::EngineSnapshot;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+
+pub(crate) fn per_second(value: u64, elapsed: Duration) -> u64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 {
+        0
+    } else {
+        (value as f64 / seconds).round() as u64
+    }
+}
 
 /// A complete snapshot of all hardware metrics at a point in time.
 #[derive(Clone, serde::Serialize, Debug)]
@@ -105,9 +114,15 @@ pub async fn metrics_collector(
     sys.refresh_cpu_usage();
 
     let mut memory_logged = false;
+    interval.tick().await;
+    let mut last_refresh = Instant::now();
 
     loop {
         interval.tick().await;
+
+        let refresh_at = Instant::now();
+        let elapsed = refresh_at.duration_since(last_refresh);
+        last_refresh = refresh_at;
 
         // Refresh sysinfo state (MUST use same instances for deltas)
         sys.refresh_cpu_usage();
@@ -163,8 +178,8 @@ pub async fn metrics_collector(
             gpus,
             cpu: cpu::collect_cpu_metrics(&sys),
             memory: memory_metrics,
-            disk: disk::collect_disk_metrics(&disks),
-            network: network::collect_network_metrics(&networks),
+            disk: disk::collect_disk_metrics(&disks, elapsed),
+            network: network::collect_network_metrics(&networks, elapsed),
             engines,
             gpu_events,
         };
@@ -201,9 +216,15 @@ pub async fn metrics_collector(
 
     // Initial CPU refresh
     sys.refresh_cpu_usage();
+    interval.tick().await;
+    let mut last_refresh = Instant::now();
 
     loop {
         interval.tick().await;
+
+        let refresh_at = Instant::now();
+        let elapsed = refresh_at.duration_since(last_refresh);
+        last_refresh = refresh_at;
 
         sys.refresh_cpu_usage();
         sys.refresh_memory();
@@ -236,8 +257,8 @@ pub async fn metrics_collector(
             gpus,
             cpu: cpu::collect_cpu_metrics(&sys),
             memory: memory::collect_memory_metrics(&sys),
-            disk: disk::collect_disk_metrics(&disks),
-            network: network::collect_network_metrics(&networks),
+            disk: disk::collect_disk_metrics(&disks, elapsed),
+            network: network::collect_network_metrics(&networks, elapsed),
             engines,
             gpu_events,
         };
@@ -298,6 +319,7 @@ pub struct CoreMetrics {
 /// view to keep utilisation percentages honest.
 #[derive(Clone, serde::Serialize, Debug)]
 pub struct MemoryMetrics {
+    pub source_available: bool,
     pub total_bytes: u64,
     pub display_total_bytes: u64,
     pub used_bytes: u64,
@@ -323,4 +345,16 @@ pub struct NetworkMetrics {
     pub name: Option<String>,
     pub rx_bytes_per_sec: u64,
     pub tx_bytes_per_sec: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_delta_is_normalized_by_actual_elapsed_time() {
+        assert_eq!(per_second(2_000, Duration::from_secs(1)), 2_000);
+        assert_eq!(per_second(2_000, Duration::from_secs(2)), 1_000);
+        assert_eq!(per_second(2_000, Duration::ZERO), 0);
+    }
 }

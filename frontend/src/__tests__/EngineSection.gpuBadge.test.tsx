@@ -19,6 +19,7 @@ function engine(gpuIndexes: number[] | undefined): EngineSnapshot {
       pipeline_tag: null,
     },
     metrics: null,
+    sampled_at_ms: null,
     recent_requests: [],
     deployment_mode: 'Docker',
     gpu_indexes: gpuIndexes,

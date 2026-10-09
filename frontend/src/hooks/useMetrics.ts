@@ -11,8 +11,6 @@ export function useMetrics() {
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
   const attemptRef = useRef(0)
-  const pendingRef = useRef<MetricsSnapshot | null>(null)
-  const initialFlushDone = useRef(false)
 
   // `connect` is declared inside the effect rather than as a `useCallback`
   // because the reconnect path schedules `connect` itself. A `useCallback`
@@ -35,14 +33,8 @@ export function useMetrics() {
         try {
           const data = JSON.parse(event.data) as MetricsSnapshot
           lastMessageTime.current = Date.now()
-          pendingRef.current = data
-          // Render the very first snapshot immediately so the UI isn't blank
-          if (!initialFlushDone.current) {
-            initialFlushDone.current = true
-            setMetrics(data)
-            pendingRef.current = null
-            setIsStale(false)
-          }
+          setMetrics(data)
+          setIsStale(false)
         } catch { /* ignore parse errors */ }
       }
 
@@ -66,26 +58,20 @@ export function useMetrics() {
     }
   }, [])
 
-  // Periodic flush: push the latest pending snapshot into React state.
-  // Skips when the tab is hidden so the browser can fully throttle the page.
+  // Staleness is checked separately from measurement delivery so render timing
+  // cannot drop snapshots from the history layer.
   useEffect(() => {
-    function flush() {
-      if (document.hidden) return
-      if (pendingRef.current) {
-        setMetrics(pendingRef.current)
-        pendingRef.current = null
-        setIsStale(false)
-      } else if (connectionStatus === 'connected' && lastMessageTime.current > 0) {
+    function checkStale() {
+      if (connectionStatus === 'connected' && lastMessageTime.current > 0) {
         setIsStale(Date.now() - lastMessageTime.current > 5000)
       }
     }
 
-    // When the tab becomes visible again, flush immediately
     function onVisible() {
-      if (!document.hidden) flush()
+      if (!document.hidden) checkStale()
     }
 
-    const id = setInterval(flush, 2000)
+    const id = setInterval(checkStale, 2000)
     document.addEventListener('visibilitychange', onVisible)
 
     return () => {

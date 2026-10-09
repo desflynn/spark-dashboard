@@ -17,8 +17,6 @@ export interface AggregateSnapshot {
   // SUM across running engines
   tokens_per_sec: number | null
   avg_tokens_per_sec: number | null
-  prompt_tokens_per_sec: number | null
-  avg_prompt_tokens_per_sec: number | null
   active_requests: number | null
   queued_requests: number | null
   total_requests: number | null
@@ -27,6 +25,8 @@ export interface AggregateSnapshot {
   total_prompt_tokens: number | null
   total_generation_tokens: number | null
   prefix_cache_queries_total: number | null
+  /** Cumulative uncached prefill tokens across engines (sum). */
+  pure_prefill_tokens: number | null
 
   // Speculative decoding. Cumulative counters are summed; TAR and mean
   // acceptance length are recomputed from the aggregated sums (not averaged
@@ -43,8 +43,19 @@ export interface AggregateSnapshot {
   e2e_latency_ms: number | null
   queue_time_ms: number | null
   inter_token_latency_ms: number | null
+  tpot_ms: number | null
   per_request_tps: number | null
-  per_request_prompt_tps: number | null
+  /** Most recent completed request's uncached prefill rate (mean across
+   *  engines that have one). Persists across idle at the engine level. */
+  last_req_pp: number | null
+  /** 5-min uncached prefill rate. Cross-engine mean of engines that have one
+   *  — token-weighted aggregation would need per-engine (dtok, dsec) sums
+   *  exposed by the Rust adapter, which isn't warranted for the fleet view. */
+  pp_5min: number | null
+  /** Lifetime uncached prefill rate. Same aggregation caveat as pp_5min. */
+  pp_lifetime: number | null
+  /** Most recent completed request's decode rate (mean across engines). */
+  last_req_tg: number | null
 
   // Simple mean across running engines
   avg_batch_size: number | null
@@ -64,6 +75,7 @@ export interface AggregateSnapshot {
   ttft_goodput_pct: number | null
   itl_goodput_pct: number | null
   e2e_goodput_pct: number | null
+  tpot_goodput_pct: number | null
 }
 
 function sumOrNull(values: Array<number | null | undefined>): number | null {
@@ -118,8 +130,6 @@ function emptySnapshot(totalCount: number): AggregateSnapshot {
     total_count: totalCount,
     tokens_per_sec: null,
     avg_tokens_per_sec: null,
-    prompt_tokens_per_sec: null,
-    avg_prompt_tokens_per_sec: null,
     active_requests: null,
     queued_requests: null,
     total_requests: null,
@@ -128,6 +138,7 @@ function emptySnapshot(totalCount: number): AggregateSnapshot {
     total_prompt_tokens: null,
     total_generation_tokens: null,
     prefix_cache_queries_total: null,
+    pure_prefill_tokens: null,
     spec_decode_draft_tokens_total: null,
     spec_decode_accepted_tokens_total: null,
     spec_decode_drafts_total: null,
@@ -138,8 +149,12 @@ function emptySnapshot(totalCount: number): AggregateSnapshot {
     e2e_latency_ms: null,
     queue_time_ms: null,
     inter_token_latency_ms: null,
+    tpot_ms: null,
     per_request_tps: null,
-    per_request_prompt_tps: null,
+    last_req_pp: null,
+    pp_5min: null,
+    pp_lifetime: null,
+    last_req_tg: null,
     avg_batch_size: null,
     kv_cache_percent: null,
     prefix_cache_hit_rate: null,
@@ -149,6 +164,7 @@ function emptySnapshot(totalCount: number): AggregateSnapshot {
     ttft_goodput_pct: null,
     itl_goodput_pct: null,
     e2e_goodput_pct: null,
+    tpot_goodput_pct: null,
   }
 }
 
@@ -252,10 +268,12 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
   const get = (key: keyof NonNullable<EngineSnapshot['metrics']>) =>
     metrics.map((m) => (m ? (m[key] as number | null | undefined) : null))
 
-  const weights = get('total_requests')
-  const weightedBy = (key: keyof NonNullable<EngineSnapshot['metrics']>) =>
+  const weightedBy = (
+    key: keyof NonNullable<EngineSnapshot['metrics']>,
+    weightKey: keyof NonNullable<EngineSnapshot['metrics']> = 'total_requests',
+  ) =>
     weightedMeanOrNull(
-      get(key).map((value, i) => ({ value, weight: weights[i] })),
+      get(key).map((value, i) => ({ value, weight: get(weightKey)[i] })),
     )
 
   // Speculative decoding: sum the cumulative counters, then recompute TAR and
@@ -274,8 +292,6 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
     // Additive
     tokens_per_sec: sumOrNull(get('tokens_per_sec')),
     avg_tokens_per_sec: sumOrNull(get('avg_tokens_per_sec')),
-    prompt_tokens_per_sec: sumOrNull(get('prompt_tokens_per_sec')),
-    avg_prompt_tokens_per_sec: sumOrNull(get('avg_prompt_tokens_per_sec')),
     active_requests: sumOrNull(get('active_requests')),
     queued_requests: sumOrNull(get('queued_requests')),
     total_requests: sumOrNull(get('total_requests')),
@@ -284,6 +300,7 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
     total_prompt_tokens: sumOrNull(get('total_prompt_tokens')),
     total_generation_tokens: sumOrNull(get('total_generation_tokens')),
     prefix_cache_queries_total: sumOrNull(get('prefix_cache_queries_total')),
+    pure_prefill_tokens: sumOrNull(get('pure_prefill_tokens')),
 
     // Speculative decoding — additive counters + sum-derived ratios.
     spec_decode_draft_tokens_total: specDraftTokens,
@@ -306,35 +323,48 @@ export function aggregateEngines(engines: readonly EngineSnapshot[]): AggregateS
     spec_decode_mean_acceptance_length: ratio(specAcceptedTokens, specDrafts),
 
     // Weighted mean
-    ttft_ms: weightedBy('ttft_ms'),
-    e2e_latency_ms: weightedBy('e2e_latency_ms'),
+    ttft_ms: weightedBy('ttft_ms', 'ttft_observations'),
+    e2e_latency_ms: weightedBy('e2e_latency_ms', 'e2e_observations'),
     queue_time_ms: weightedBy('queue_time_ms'),
-    inter_token_latency_ms: weightedBy('inter_token_latency_ms'),
+    inter_token_latency_ms: weightedBy('inter_token_latency_ms', 'itl_observations'),
+    tpot_ms: weightedBy('tpot_ms', 'tpot_observations'),
     per_request_tps: weightedBy('per_request_tps'),
-    per_request_prompt_tps: weightedBy('per_request_prompt_tps'),
+    // Uncached PP: no per-engine (dtok, dsec) sums exposed, so cross-engine
+    // aggregation is a simple mean of the engines that have one. A fleet of
+    // matched engines yields the honest number; a mixed fleet is approximate.
+    last_req_pp: meanOrNull(get('last_req_pp')),
+    pp_5min: meanOrNull(get('pp_5min')),
+    pp_lifetime: meanOrNull(get('pp_lifetime')),
+    last_req_tg: meanOrNull(get('last_req_tg')),
 
     // Simple mean
     avg_batch_size: meanOrNull(get('avg_batch_size')),
-    kv_cache_percent: meanOrNull(get('kv_cache_percent')),
-    prefix_cache_hit_rate: meanOrNull(get('prefix_cache_hit_rate')),
+    kv_cache_percent: running.length === 1 ? meanOrNull(get('kv_cache_percent')) : null,
+    prefix_cache_hit_rate: weightedMeanOrNull(
+      get('prefix_cache_hit_rate').map((value, i) => ({
+        value,
+        weight: get('prefix_cache_queries_total')[i],
+      })),
+    ),
 
     // Tail latency — weighted mean per quantile.
     ttft_percentiles: aggregatePercentiles(
       metrics.map((m) => m?.ttft_percentiles ?? null),
-      weights,
+      get('ttft_observations'),
     ),
     itl_percentiles: aggregatePercentiles(
       metrics.map((m) => m?.itl_percentiles ?? null),
-      weights,
+      get('itl_observations'),
     ),
     e2e_percentiles: aggregatePercentiles(
       metrics.map((m) => m?.e2e_percentiles ?? null),
-      weights,
+      get('e2e_observations'),
     ),
 
     // Goodput — weighted mean by total_requests, same caveat as percentiles.
-    ttft_goodput_pct: weightedBy('ttft_goodput_pct'),
-    itl_goodput_pct: weightedBy('itl_goodput_pct'),
-    e2e_goodput_pct: weightedBy('e2e_goodput_pct'),
+    ttft_goodput_pct: weightedBy('ttft_goodput_pct', 'ttft_observations'),
+    itl_goodput_pct: weightedBy('itl_goodput_pct', 'itl_observations'),
+    e2e_goodput_pct: weightedBy('e2e_goodput_pct', 'e2e_observations'),
+    tpot_goodput_pct: weightedBy('tpot_goodput_pct', 'tpot_observations'),
   }
 }

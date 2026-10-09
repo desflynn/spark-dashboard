@@ -1,8 +1,9 @@
 use crate::metrics::DiskMetrics;
+use std::time::Duration;
 
 /// Collect aggregate disk I/O throughput metrics from sysinfo Disks.
 /// Since we refresh every ~1 second, the delta values approximate bytes/sec.
-pub fn collect_disk_metrics(disks: &sysinfo::Disks) -> DiskMetrics {
+pub fn collect_disk_metrics(disks: &sysinfo::Disks, elapsed: Duration) -> DiskMetrics {
     let mut total_read: u64 = 0;
     let mut total_write: u64 = 0;
 
@@ -22,8 +23,8 @@ pub fn collect_disk_metrics(disks: &sysinfo::Disks) -> DiskMetrics {
 
     DiskMetrics {
         name,
-        read_bytes_per_sec: total_read,
-        write_bytes_per_sec: total_write,
+        read_bytes_per_sec: crate::metrics::per_second(total_read, elapsed),
+        write_bytes_per_sec: crate::metrics::per_second(total_write, elapsed),
     }
 }
 
@@ -34,7 +35,7 @@ mod tests {
     #[test]
     fn collect_disk_metrics_with_fresh_disks_returns_zero_or_valid() {
         let disks = sysinfo::Disks::new_with_refreshed_list();
-        let metrics = collect_disk_metrics(&disks);
+        let metrics = collect_disk_metrics(&disks, Duration::from_secs(1));
         // First reading should be zero or small values (delta since last refresh)
         assert!(metrics.read_bytes_per_sec < u64::MAX);
         assert!(metrics.write_bytes_per_sec < u64::MAX);
