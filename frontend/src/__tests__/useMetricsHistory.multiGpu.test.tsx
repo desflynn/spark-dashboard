@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useMetricsHistory } from '../hooks/useMetricsHistory'
+import { engineKey } from '../lib/identity'
 import type { MetricsSnapshot } from '../types/metrics'
 
 const baseSnapshot: MetricsSnapshot = {
@@ -51,6 +52,7 @@ const baseSnapshot: MetricsSnapshot = {
   ],
   cpu: { name: 'CPU', aggregate_percent: 25, per_core: [] },
   memory: {
+    source_available: true,
     total_bytes: 128,
     display_total_bytes: 128,
     used_bytes: 64,
@@ -68,6 +70,26 @@ const baseSnapshot: MetricsSnapshot = {
 }
 
 describe('useMetricsHistory multi-GPU metrics', () => {
+  it('keeps restored Qwen prefill separate from the legacy gross-counter series', () => {
+    const engine = {
+      engine_type: 'Vllm', endpoint: 'http://localhost:18300',
+      status: { type: 'Running' }, model: null, deployment_mode: 'Docker',
+      gpu_indexes: [], recent_requests: [], sampled_at_ms: 900,
+      metrics: { pp_5min: 1250, prompt_tokens_per_sec: 100000, prompt_tokens_per_sec_interval_ms: 1000 },
+    } as unknown as MetricsSnapshot['engines'][number]
+    const snapshot = { ...baseSnapshot, engines: [engine] }
+    const { result, rerender } = renderHook(
+      ({ metrics }) => useMetricsHistory(metrics),
+      { initialProps: { metrics: snapshot } },
+    )
+    act(() => rerender({ metrics: { ...snapshot, timestamp_ms: 2000 } }))
+    const key = engineKey(engine)
+    expect(result.current.getChartData(`${key}:pp`)).toEqual([{ timestamp: 900, value: 1250 }])
+    expect(result.current.getChartData(`${key}:promptTps`)).toEqual([
+      { timestamp: 900, value: 100000, durationMs: 1000 },
+    ])
+  })
+
   it('keeps per-GPU chart series separate while preserving primary GPU keys', () => {
     const { result, rerender } = renderHook(
       ({ metrics }) => useMetricsHistory(metrics),
@@ -80,5 +102,68 @@ describe('useMetricsHistory multi-GPU metrics', () => {
     expect(result.current.getChartData('gpu:0:gpuUtil').map((p) => p.value)).toEqual([11])
     expect(result.current.getChartData('gpu:1:gpuUtil').map((p) => p.value)).toEqual([77])
     expect(result.current.getChartData('gpu:1:gpuPower').map((p) => p.value)).toEqual([220])
+  })
+
+  it('rejects out-of-order snapshots and records represented elapsed time', () => {
+    const { result, rerender } = renderHook(
+      ({ metrics }) => useMetricsHistory(metrics),
+      { initialProps: { metrics: null as MetricsSnapshot | null } },
+    )
+
+    act(() => rerender({ metrics: baseSnapshot }))
+    act(() => rerender({
+      metrics: {
+        ...baseSnapshot,
+        timestamp_ms: 2_500,
+        cpu: { ...baseSnapshot.cpu, aggregate_percent: 40 },
+      },
+    }))
+    act(() => rerender({
+      metrics: {
+        ...baseSnapshot,
+        timestamp_ms: 2_000,
+        cpu: { ...baseSnapshot.cpu, aggregate_percent: 99 },
+      },
+    }))
+
+    expect(result.current.getChartData('cpuAggregate')).toEqual([
+      { timestamp: 1_000, value: 25, durationMs: 0 },
+      { timestamp: 2_500, value: 40, durationMs: 1_500 },
+    ])
+  })
+
+  it('records each engine scrape once using the engine measurement timestamp', () => {
+    const metrics = (sampled_at_ms: number, tokens_per_sec: number) => ({
+      ...baseSnapshot,
+      engines: [{
+        engine_type: 'Vllm' as const,
+        endpoint: 'http://localhost:8000',
+        status: { type: 'Running' as const },
+        model: null,
+        deployment_mode: 'Docker' as const,
+        gpu_indexes: [],
+        recent_requests: [],
+        sampled_at_ms,
+        metrics: {
+          tokens_per_sec,
+          tokens_per_sec_interval_ms: 1_000,
+          prompt_tokens_per_sec: tokens_per_sec * 10,
+          prompt_tokens_per_sec_interval_ms: 1_000,
+        },
+      } as unknown as MetricsSnapshot['engines'][number]],
+    })
+    const { result, rerender } = renderHook(
+      ({ snapshot }) => useMetricsHistory(snapshot),
+      { initialProps: { snapshot: null as MetricsSnapshot | null } },
+    )
+
+    act(() => rerender({ snapshot: { ...metrics(900, 10), timestamp_ms: 1_000 } }))
+    act(() => rerender({ snapshot: { ...metrics(900, 10), timestamp_ms: 2_000 } }))
+    act(() => rerender({ snapshot: { ...metrics(2_900, 20), timestamp_ms: 3_000 } }))
+
+    expect(result.current.getChartData(`${engineKey(metrics(900, 10).engines[0])}:tps`)).toEqual([
+      { timestamp: 900, value: 10, durationMs: 1_000 },
+      { timestamp: 2_900, value: 20, durationMs: 1_000 },
+    ])
   })
 })

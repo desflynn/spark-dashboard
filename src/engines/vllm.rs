@@ -7,8 +7,25 @@ use super::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/// Paired native prefill histogram values from one scrape.
+#[derive(Clone, Copy, Debug)]
+struct PrefillSample {
+    pkc_sum: f64,
+    pt_sum: f64,
+    pt_count: u64,
+}
+
+/// Historical request-completion sample for the five-minute PP window.
+#[derive(Clone, Copy, Debug)]
+struct PpSample {
+    at: Instant,
+    dtok: f64,
+    dsec: f64,
+}
 
 /// Default number of requests to skip on engine startup before baselining.
 /// vLLM's first inference is dominated by CUDA kernel JIT and KV cache
@@ -83,6 +100,9 @@ pub struct VllmAdapter {
     prev_gen_tokens: Mutex<Option<(f64, Instant)>>,
     /// Previous prompt_tokens_total counter reading for rate computation.
     prev_prompt_tokens: Mutex<Option<(f64, Instant)>>,
+    prev_prefill: Mutex<Option<PrefillSample>>,
+    pp_ring: Mutex<VecDeque<PpSample>>,
+    last_req_pp: Mutex<Option<f64>>,
     /// Previous (accepted, draft) spec-decode counter readings, used to compute
     /// the live (windowed) token acceptance rate from per-poll deltas. No
     /// timestamp is stored because the live TAR is a unit-free ratio of deltas.
@@ -105,6 +125,17 @@ pub struct VllmAdapter {
     last_hf_error: Mutex<Option<Instant>>,
 }
 
+fn counter_rate(current: f64, previous: f64, elapsed: Duration) -> (Option<f64>, Option<u64>) {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 || current < previous {
+        return (None, None);
+    }
+    (
+        Some((current - previous) / seconds),
+        Some(elapsed.as_millis() as u64),
+    )
+}
+
 impl VllmAdapter {
     pub fn new(
         client: reqwest::Client,
@@ -119,6 +150,9 @@ impl VllmAdapter {
             served_model,
             prev_gen_tokens: Mutex::new(None),
             prev_prompt_tokens: Mutex::new(None),
+            prev_prefill: Mutex::new(None),
+            pp_ring: Mutex::new(VecDeque::new()),
+            last_req_pp: Mutex::new(None),
             prev_spec_decode: Mutex::new(None),
             avg_accum: Mutex::new((0.0, 0)),
             avg_prompt_accum: Mutex::new((0.0, 0)),
@@ -437,6 +471,9 @@ impl EngineAdapter for VllmAdapter {
         if warmup_out.just_transitioned {
             *self.prev_gen_tokens.lock().await = None;
             *self.prev_prompt_tokens.lock().await = None;
+            *self.prev_prefill.lock().await = None;
+            self.pp_ring.lock().await.clear();
+            *self.last_req_pp.lock().await = None;
             *self.prev_spec_decode.lock().await = None;
             *self.avg_accum.lock().await = (0.0, 0);
             *self.avg_prompt_accum.lock().await = (0.0, 0);
@@ -512,46 +549,103 @@ impl EngineAdapter for VllmAdapter {
 
         // TPS from generation_tokens_total counter (rate = delta / elapsed)
         let current_gen = parsed.counters.get("vllm_generation_tokens_total").copied();
+        let total_gen = raw.counters.get("vllm_generation_tokens_total").copied();
         let now = Instant::now();
 
-        let tokens_per_sec = {
+        let (tokens_per_sec, tokens_per_sec_interval_ms) = {
             let mut prev_lock = self.prev_gen_tokens.lock().await;
-            let tps = match (current_gen, prev_lock.as_ref()) {
+            let rate = match (current_gen, prev_lock.as_ref()) {
                 (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
+                    counter_rate(current, prev_val, now.duration_since(prev_time))
                 }
-                _ => None,
+                _ => (None, None),
             };
             if let Some(val) = current_gen {
                 *prev_lock = Some((val, now));
             }
-            tps
+            rate
         };
+
+        // Restore the pre-October custom PP path. Native histograms report
+        // computed tokens and prefill seconds together at completion; gross
+        // prompt-counter jumps and TTFT are not its rate inputs. Raw values
+        // preserve lifetime totals across the dashboard warmup baseline.
+        let curr_prefill = {
+            let pkc_sum = raw
+                .counters
+                .get("vllm_request_prefill_kv_computed_tokens_sum")
+                .copied();
+            let pt_sum = raw
+                .counters
+                .get("vllm_request_prefill_time_seconds_sum")
+                .copied();
+            let pt_count = raw
+                .counters
+                .get("vllm_request_prefill_time_seconds_count")
+                .copied();
+            match (pkc_sum, pt_sum, pt_count) {
+                (Some(a), Some(c), Some(d)) => Some(PrefillSample {
+                    pkc_sum: a,
+                    pt_sum: c,
+                    pt_count: d as u64,
+                }),
+                _ => None,
+            }
+        };
+        let (last_req_pp, pp_5min) = {
+            let mut prev = self.prev_prefill.lock().await;
+            let mut ring = self.pp_ring.lock().await;
+            let mut last = self.last_req_pp.lock().await;
+            if let (Some(cur), Some(pv)) = (curr_prefill, *prev) {
+                if let Some((dtok, dsec)) = detect_pp_completion(pv, cur) {
+                    ring.push_back(PpSample {
+                        at: now,
+                        dtok,
+                        dsec,
+                    });
+                    *last = Some(dtok / dsec);
+                }
+            }
+            if let Some(cutoff) = now.checked_sub(Duration::from_secs(300)) {
+                while ring.front().is_some_and(|front| front.at < cutoff) {
+                    ring.pop_front();
+                }
+            }
+            if curr_prefill.is_some() {
+                *prev = curr_prefill;
+            }
+            let pp_5min = if ring.is_empty() {
+                None
+            } else {
+                let (tokens, seconds) = ring
+                    .iter()
+                    .fold((0.0_f64, 0.0_f64), |(t, s), r| (t + r.dtok, s + r.dsec));
+                if seconds > 0.0 {
+                    Some(tokens / seconds)
+                } else {
+                    None
+                }
+            };
+            (*last, pp_5min)
+        };
+        let pp_lifetime = curr_prefill.and_then(pp_lifetime_rate);
+        let pure_prefill_tokens = curr_prefill.map(|sample| sample.pkc_sum as u64);
 
         // Prompt tokens/sec from prompt_tokens_total counter (rate = delta / elapsed)
         let current_prompt = parsed.counters.get("vllm_prompt_tokens_total").copied();
-        let prompt_tokens_per_sec = {
+        let total_prompt = raw.counters.get("vllm_prompt_tokens_total").copied();
+        let (prompt_tokens_per_sec, prompt_tokens_per_sec_interval_ms) = {
             let mut prev_lock = self.prev_prompt_tokens.lock().await;
-            let tps = match (current_prompt, prev_lock.as_ref()) {
+            let rate = match (current_prompt, prev_lock.as_ref()) {
                 (Some(current), Some(&(prev_val, prev_time))) => {
-                    let elapsed = now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        Some((current - prev_val) / elapsed)
-                    } else {
-                        None
-                    }
+                    counter_rate(current, prev_val, now.duration_since(prev_time))
                 }
-                _ => None,
+                _ => (None, None),
             };
             if let Some(val) = current_prompt {
                 *prev_lock = Some((val, now));
             }
-            tps
+            rate
         };
 
         // Avg TPS = sum of non-zero TPS readings / count of readings.
@@ -623,8 +717,8 @@ impl EngineAdapter for VllmAdapter {
         // Guard against queries == 0 so the tile stays blank until the engine
         // has served at least one prompt.
         let prefix_cache_hit_rate = {
-            let hits = parsed.counters.get("vllm_prefix_cache_hits_total");
-            let queries = parsed.counters.get("vllm_prefix_cache_queries_total");
+            let hits = raw.counters.get("vllm_prefix_cache_hits_total");
+            let queries = raw.counters.get("vllm_prefix_cache_queries_total");
             match (hits, queries) {
                 (Some(&h), Some(&q)) if q > 0.0 => Some((h / q) * 100.0),
                 _ => None,
@@ -634,7 +728,7 @@ impl EngineAdapter for VllmAdapter {
         // Cumulative prefix-cache queries — pass-through lifetime counter, the
         // volume the hit rate is derived from. Mirrors total_*_tokens: shown
         // raw and ungated by warmup so it stays continuous.
-        let prefix_cache_queries_total = parsed
+        let prefix_cache_queries_total = raw
             .counters
             .get("vllm_prefix_cache_queries_total")
             .map(|&q| q as u64);
@@ -838,6 +932,17 @@ impl EngineAdapter for VllmAdapter {
         let tpot_percentiles = tpot_hist.and_then(percentiles_ms);
         let tpot_goodput_pct = tpot_hist.and_then(|m| goodput_pct(m, TPOT_SLO_MS));
         let tpot_buckets = tpot_hist.and_then(buckets_for);
+        let observations = |metric: &str| -> Option<u64> {
+            parsed
+                .histograms
+                .get(metric)
+                .and_then(|buckets| buckets.last())
+                .map(|(_, count)| *count as u64)
+        };
+        let ttft_observations = observations("vllm_time_to_first_token_seconds");
+        let itl_observations = observations("vllm_inter_token_latency_seconds");
+        let e2e_observations = observations("vllm_e2e_request_latency_seconds");
+        let tpot_observations = tpot_hist.and_then(observations);
 
         // While warming, histogram-derived metrics still compute from raw
         // pass-through counters/buckets (the tracker doesn't yet have a
@@ -848,29 +953,46 @@ impl EngineAdapter for VllmAdapter {
         let blank = warming_up;
         Some(EngineMetrics {
             tokens_per_sec: if blank { None } else { tokens_per_sec },
+            tokens_per_sec_interval_ms: if blank {
+                None
+            } else {
+                tokens_per_sec_interval_ms
+            },
             avg_tokens_per_sec: if blank { None } else { avg_tokens_per_sec },
             per_request_tps: if blank { None } else { per_request_tps },
             ttft_ms: if blank { None } else { ttft_ms },
+            ttft_observations: if blank { None } else { ttft_observations },
             active_requests,
             queued_requests,
             kv_cache_percent,
             kv_cache_is_estimated: false,
             total_requests,
             e2e_latency_ms: if blank { None } else { e2e_latency_ms },
+            e2e_observations: if blank { None } else { e2e_observations },
             prompt_tokens_per_sec: if blank { None } else { prompt_tokens_per_sec },
+            prompt_tokens_per_sec_interval_ms: if blank {
+                None
+            } else {
+                prompt_tokens_per_sec_interval_ms
+            },
             avg_prompt_tokens_per_sec: if blank {
                 None
             } else {
                 avg_prompt_tokens_per_sec
             },
             per_request_prompt_tps: if blank { None } else { per_request_prompt_tps },
+            last_req_pp: if blank { None } else { last_req_pp },
+            pp_5min: if blank { None } else { pp_5min },
+            pp_lifetime: if blank { None } else { pp_lifetime },
+            pure_prefill_tokens: if blank { None } else { pure_prefill_tokens },
             swapped_requests,
             prefix_cache_hit_rate,
             queue_time_ms: if blank { None } else { queue_time_ms },
             inter_token_latency_ms: if blank { None } else { inter_token_latency_ms },
+            itl_observations: if blank { None } else { itl_observations },
             preemptions_total,
-            total_prompt_tokens: current_prompt.map(|v| v as u64),
-            total_generation_tokens: current_gen.map(|v| v as u64),
+            total_prompt_tokens: total_prompt.map(|v| v as u64),
+            total_generation_tokens: total_gen.map(|v| v as u64),
             prefix_cache_queries_total,
             avg_batch_size: if blank { None } else { avg_batch_size },
             ttft_percentiles: if blank { None } else { ttft_percentiles },
@@ -883,6 +1005,7 @@ impl EngineAdapter for VllmAdapter {
             itl_buckets: if blank { None } else { itl_buckets },
             e2e_buckets: if blank { None } else { e2e_buckets },
             tpot_ms: if blank { None } else { tpot_ms },
+            tpot_observations: if blank { None } else { tpot_observations },
             tpot_percentiles: if blank { None } else { tpot_percentiles },
             tpot_goodput_pct: if blank { None } else { tpot_goodput_pct },
             tpot_buckets: if blank { None } else { tpot_buckets },
@@ -929,9 +1052,102 @@ fn spec_mean_acceptance_length(accepted: Option<f64>, drafts: Option<f64>) -> Op
     }
 }
 
+/// Historical completion derivation: one or more new observations must have
+/// a positive prefill-time delta and a non-negative computed-token delta.
+fn detect_pp_completion(prev: PrefillSample, cur: PrefillSample) -> Option<(f64, f64)> {
+    if cur.pt_count <= prev.pt_count {
+        return None;
+    }
+    let dtok = cur.pkc_sum - prev.pkc_sum;
+    let dsec = cur.pt_sum - prev.pt_sum;
+    if dsec > 0.0 && dtok >= 0.0 {
+        Some((dtok, dsec))
+    } else {
+        None
+    }
+}
+
+fn pp_lifetime_rate(sample: PrefillSample) -> Option<f64> {
+    if sample.pt_sum > 0.0 {
+        Some(sample.pkc_sum / sample.pt_sum)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restored_qwen_prefill_uses_native_counters_and_keeps_idle_values() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // First row is the saved current Qwen receipt. Later rows exercise
+            // the historical completion window without calling a real model.
+            for (tokens, seconds, count, gross) in [
+                (49131.0, 43.53384248999646, 5, 49131),
+                (50131.0, 44.03384248999646, 6, 2000000),
+                (51631.0, 45.53384248999646, 7, 3000000),
+                (51631.0, 45.53384248999646, 7, 3000000),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let size = socket.read(&mut request).await.unwrap();
+                assert!(std::str::from_utf8(&request[..size])
+                    .unwrap()
+                    .starts_with("GET /metrics "));
+                let body = format!(
+                    "vllm:prompt_tokens_total {gross}\n\
+                     vllm:request_prefill_kv_computed_tokens_sum {tokens}\n\
+                     vllm:request_prefill_time_seconds_sum {seconds}\n\
+                     vllm:request_prefill_time_seconds_count {count}\n\
+                     vllm:time_to_first_token_seconds_sum 45.224502086639404\n\
+                     vllm:time_to_first_token_seconds_count {count}\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let adapter = VllmAdapter::new(reqwest::Client::new(), endpoint, None, None);
+        *adapter.warmup.lock().await = WarmupTracker::new(0);
+        let initial = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        let expected = 49131.0 / 43.53384248999646;
+        assert!((initial["pp_lifetime"].as_f64().unwrap_or(-1.0) - expected).abs() < 1e-9);
+        assert_eq!(initial["pure_prefill_tokens"], 49131);
+        assert!(initial["pp_5min"].is_null());
+
+        let first = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        assert_eq!(first["last_req_pp"], 2000.0);
+        assert_eq!(first["pp_5min"], 2000.0);
+        let second = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        assert_eq!(second["last_req_pp"], 1000.0);
+        assert_eq!(second["pp_5min"], 1250.0);
+        let idle = serde_json::to_value(adapter.get_metrics().await.unwrap()).unwrap();
+        assert_eq!(idle["last_req_pp"], second["last_req_pp"]);
+        assert_eq!(idle["pp_5min"], second["pp_5min"]);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn counter_rate_uses_elapsed_time_and_rejects_counter_resets() {
+        assert_eq!(
+            counter_rate(100.0, 90.0, Duration::from_secs(2)),
+            (Some(5.0), Some(2000))
+        );
+        assert_eq!(
+            counter_rate(5.0, 90.0, Duration::from_secs(1)),
+            (None, None)
+        );
+        assert_eq!(counter_rate(100.0, 90.0, Duration::ZERO), (None, None));
+    }
 
     /// HF enrichment misses for non-public model ids (401/403/404) are
     /// expected and must stay quiet; other non-success statuses (e.g. 5xx,

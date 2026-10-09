@@ -53,6 +53,7 @@ export interface CoreMetrics {
 }
 
 export interface MemoryMetrics {
+  source_available: boolean
   total_bytes: number
   /** Headline pool size for the UI. On unified-memory systems this is sourced
    *  from NVML so the marketed capacity (e.g. 128 GB on DGX Spark) is shown
@@ -121,9 +122,11 @@ export interface HistogramBucket {
 
 export interface EngineMetrics {
   tokens_per_sec: number | null
+  tokens_per_sec_interval_ms: number | null
   avg_tokens_per_sec: number | null
   per_request_tps: number | null
   ttft_ms: number | null
+  ttft_observations: number | null
   active_requests: number | null
   queued_requests: number | null
   kv_cache_percent: number | null
@@ -131,13 +134,21 @@ export interface EngineMetrics {
   total_requests: number | null
   // --- New metrics ---
   e2e_latency_ms: number | null
+  e2e_observations: number | null
   prompt_tokens_per_sec: number | null
+  prompt_tokens_per_sec_interval_ms: number | null
   avg_prompt_tokens_per_sec: number | null
   per_request_prompt_tps: number | null
+  /** Restored custom Qwen prefill fields; not inferred from gross prompt rates. */
+  last_req_pp?: number | null
+  pp_5min?: number | null
+  pp_lifetime?: number | null
+  pure_prefill_tokens?: number | null
   swapped_requests: number | null
   prefix_cache_hit_rate: number | null
   queue_time_ms: number | null
   inter_token_latency_ms: number | null
+  itl_observations: number | null
   preemptions_total: number | null
   /** Cumulative prompt (prefill) tokens processed since engine start. */
   total_prompt_tokens: number | null
@@ -166,6 +177,7 @@ export interface EngineMetrics {
   /** Average time per output token during decode (ms) — the gap between
    *  generating each subsequent token, excluding TTFT. */
   tpot_ms: number | null
+  tpot_observations: number | null
   /** Tail latency percentiles for time per output token (ms). */
   tpot_percentiles: LatencyPercentiles | null
   /** % of TPOT observations meeting the TPOT SLO threshold. */
@@ -197,6 +209,8 @@ export interface EngineSnapshot {
   status: EngineStatus
   model: ModelInfo | null
   metrics: EngineMetrics | null
+  /** Wall-clock timestamp of this engine's latest metrics scrape. */
+  sampled_at_ms: number | null
   recent_requests: InferenceRequestData[]
   deployment_mode: DeploymentMode
   /** Indexes of the GPU(s) the engine was observed running on (NVML

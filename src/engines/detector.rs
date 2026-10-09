@@ -372,6 +372,37 @@ fn parse_model_from_command_str(cmd: &str) -> Option<String> {
 // Layer 2: Docker scan
 // ---------------------------------------------------------------------------
 
+/// vLLM image-provenance labels carried by official vLLM images and inherited
+/// by containers created from them.
+const VLLM_IMAGE_SOURCE_LABEL: &str = "org.opencontainers.image.source";
+const VLLM_IMAGE_SOURCE_VALUE: &str = "https://github.com/vllm-project/vllm";
+const VLLM_BUILD_COMMIT_LABEL: &str = "ai.vllm.build.commit";
+
+/// Decide whether a Docker container summary is a vLLM engine without
+/// inspecting its processes (the cheap pre-`docker top` gate).
+///
+/// Any one signal qualifies: the image reference contains "vllm", the
+/// container entrypoint command contains "vllm", or the container carries the
+/// authoritative vLLM image-provenance labels (a digest-pinned official image
+/// behind a shell-wrapper entrypoint carries neither "vllm" string).
+///
+/// Container *names* are deliberately not consulted: they are operator-chosen
+/// and commonly contain "vllm" for unrelated sidecars, so an LLM-named
+/// container (e.g. "qwen38-flash") with a digest image and a shell command
+/// and no vLLM labels must stay rejected.
+fn is_vllm_container(image: &str, command: &str, labels: Option<&HashMap<String, String>>) -> bool {
+    if image.contains("vllm") || command.contains("vllm") {
+        return true;
+    }
+    let Some(labels) = labels else {
+        return false;
+    };
+    labels.get(VLLM_IMAGE_SOURCE_LABEL).map(String::as_str) == Some(VLLM_IMAGE_SOURCE_VALUE)
+        || labels
+            .get(VLLM_BUILD_COMMIT_LABEL)
+            .is_some_and(|v| !v.is_empty())
+}
+
 #[cfg(target_os = "linux")]
 pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
     use bollard::query_parameters::{ListContainersOptions, TopOptionsBuilder};
@@ -424,12 +455,13 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
             .unwrap_or_default()
             .to_lowercase();
 
-        // Match on image name OR container command only. Container *names*
-        // are operator-chosen and commonly include "vllm" for unrelated
-        // sidecars (e.g. an OpenResty reverse proxy named "vllm-proxy"),
-        // so they are not a reliable signal and are deliberately excluded
-        // to prevent false-positive engine detection.
-        let is_vllm = image.contains("vllm") || command.contains("vllm");
+        // Match on image name, container command, or authoritative vLLM
+        // image-provenance labels. Container *names* are operator-chosen and
+        // commonly include "vllm" for unrelated sidecars (e.g. an OpenResty
+        // reverse proxy named "vllm-proxy"), so they are not a reliable
+        // signal and are deliberately excluded to prevent false-positive
+        // engine detection.
+        let is_vllm = is_vllm_container(&image, &command, container.labels.as_ref());
 
         if !is_vllm {
             continue;
@@ -603,6 +635,91 @@ mod tests {
 
     fn to_args(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
+    }
+
+    fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn digest_image_wrapper_cmd_with_official_vllm_labels_is_detected() {
+        // Qwen-refresh case: immutable sha256 image reference, shell-wrapper
+        // command — but the image's authoritative vLLM provenance labels are
+        // inherited into the container summary.
+        let labels = labels_of(&[
+            (
+                "org.opencontainers.image.source",
+                "https://github.com/vllm-project/vllm",
+            ),
+            (
+                "ai.vllm.build.commit",
+                "0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
+            ),
+        ]);
+        assert!(is_vllm_container(
+            "sha256:0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
+            "bash /opt/seat0b-runtime/serve-262k.sh",
+            Some(&labels),
+        ));
+    }
+
+    #[test]
+    fn build_commit_label_alone_is_evidence() {
+        let labels = labels_of(&[("ai.vllm.build.commit", "abc123")]);
+        assert!(is_vllm_container(
+            "sha256:0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
+            "bash /opt/seat0b-runtime/serve-262k.sh",
+            Some(&labels),
+        ));
+    }
+
+    #[test]
+    fn empty_build_commit_label_is_not_evidence() {
+        // Mere presence is not provenance: an empty value carries no commit
+        // and must not qualify a digest-pinned wrapper container.
+        let labels = labels_of(&[("ai.vllm.build.commit", "")]);
+        assert!(!is_vllm_container(
+            "sha256:0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
+            "bash /opt/seat0b-runtime/serve-262k.sh",
+            Some(&labels),
+        ));
+    }
+
+    #[test]
+    fn name_only_llm_container_without_vllm_evidence_is_rejected() {
+        // A "qwen" container *name* is not evidence: digest image + wrapper
+        // command + no vLLM labels must stay rejected (names are excluded).
+        assert!(!is_vllm_container(
+            "sha256:0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
+            "bash /opt/seat0b-runtime/serve-262k.sh",
+            None,
+        ));
+    }
+
+    #[test]
+    fn foreign_source_label_is_not_evidence() {
+        let labels = labels_of(&[(
+            "org.opencontainers.image.source",
+            "https://github.com/someone/else",
+        )]);
+        assert!(!is_vllm_container(
+            "sha256:0c41165839b20bcd8cd5d811643eab92f4b2cef5eb427d05af2d0b50606189eb",
+            "bash serve.sh",
+            Some(&labels),
+        ));
+    }
+
+    #[test]
+    fn existing_image_and_command_signals_still_qualify() {
+        assert!(is_vllm_container("vllm/vllm-openai:v0.11", "/bin/sh", None));
+        assert!(is_vllm_container(
+            "sha256:0c4116",
+            "python -m vllm.entrypoints.openai.api_server",
+            None,
+        ));
     }
 
     #[test]

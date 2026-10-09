@@ -113,6 +113,7 @@ pub fn collect_memory_metrics(device: Option<&nvml_wrapper::Device>) -> MemoryMe
     // Primary source: /proc/meminfo for system RAM
     let meminfo = procfs::Meminfo::current();
 
+    let source_available = meminfo.is_ok();
     let (total_bytes, available_bytes, cached_bytes) = match &meminfo {
         Ok(m) => {
             let total = m.mem_total;
@@ -160,6 +161,7 @@ pub fn collect_memory_metrics(device: Option<&nvml_wrapper::Device>) -> MemoryMe
     let display_total_bytes = select_display_total(is_unified, gpu_memory_total_bytes, total_bytes);
 
     MemoryMetrics {
+        source_available,
         total_bytes,
         display_total_bytes,
         used_bytes,
@@ -180,6 +182,7 @@ pub fn collect_memory_metrics(sys: &sysinfo::System) -> MemoryMetrics {
     let used_bytes = sys.used_memory();
 
     MemoryMetrics {
+        source_available: true,
         total_bytes,
         display_total_bytes: total_bytes,
         used_bytes,

@@ -360,6 +360,7 @@ mod tests {
             status: EngineStatus::Running,
             model: None,
             metrics: None,
+            sampled_at_ms: None,
             recent_requests: Vec::new(),
             deployment_mode: match container_id {
                 Some(_) => DeploymentMode::Docker,

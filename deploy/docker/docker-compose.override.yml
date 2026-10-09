@@ -1,0 +1,11 @@
+# Local override — do not commit. Added 2026-08-27 to pipe engine URL env vars
+# from .env through to the container. Upstream compose does not include these
+# in its  list. Remove when auto-discovery is fixed or upstream
+# adds them.
+services:
+  spark-dashboard:
+    environment:
+      - SPARK_DASHBOARD_ENGINE
+      - SPARK_DASHBOARD_ENGINE_URL
+      - SPARK_DASHBOARD_ENGINE_API_KEY
+      - SPARK_WARMUP_SKIP_REQUESTS

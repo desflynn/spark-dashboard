@@ -6,6 +6,7 @@ import type { MetricsSnapshot, GpuEventData, InferenceRequestData } from '../typ
 interface DataPoint {
   timestamp: number
   value: number
+  durationMs?: number
 }
 
 const BUFFER_CAPACITY = 900 // 15 minutes at 1 sample/sec
@@ -96,6 +97,7 @@ export function useMetricsHistory(
   const engineBuffersRef = useRef<
     Record<string, Record<string, CircularBuffer<DataPoint>>>
   >({})
+  const lastEngineTimestampRef = useRef<Record<string, number>>({})
   const eventBufferRef = useRef(
     new CircularBuffer<GpuEventData>(EVENT_BUFFER_CAPACITY),
   )
@@ -106,16 +108,17 @@ export function useMetricsHistory(
   const [version, setVersion] = useState(0)
 
   useEffect(() => {
-    if (!metrics || metrics.timestamp_ms === lastTimestampRef.current) return
-    lastTimestampRef.current = metrics.timestamp_ms
-
+    if (!metrics || metrics.timestamp_ms <= lastTimestampRef.current) return
     const ts = metrics.timestamp_ms
+    const previousTs = lastTimestampRef.current
+    lastTimestampRef.current = ts
+    const durationMs = previousTs > 0 && ts > previousTs ? ts - previousTs : 0
     const buffers = buffersRef.current
 
     for (const key of SYSTEM_METRIC_KEYS) {
       const val = extractValue(metrics, key)
       if (val !== null) {
-        buffers[key].push({ timestamp: ts, value: val })
+        buffers[key].push({ timestamp: ts, value: val, durationMs })
       }
     }
 
@@ -128,7 +131,7 @@ export function useMetricsHistory(
       for (const key of ['gpuUtil', 'gpuTemp', 'gpuPower', 'gpuClockGraphics'] as MetricKey[]) {
         const val = extractGpuValue(gpu, key)
         if (val !== null) {
-          gb[key].push({ timestamp: ts, value: val })
+          gb[key].push({ timestamp: ts, value: val, durationMs })
         }
       }
     }
@@ -136,20 +139,27 @@ export function useMetricsHistory(
     // Engine-specific metrics
     for (const engine of metrics.engines) {
       const key = engineKey(engine)
+      const engineTs = engine.sampled_at_ms
+      if (engineTs === null || engineTs <= (lastEngineTimestampRef.current[key] ?? 0)) continue
+      lastEngineTimestampRef.current[key] = engineTs
       if (!engineBuffersRef.current[key]) {
         engineBuffersRef.current[key] = {
           tps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           avgTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           perReqTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           ttft: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          ttftObservations: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           kvCache: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           prefixCacheHit: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           e2eLatency: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          e2eObservations: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          pp: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           promptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           avgPromptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           perReqPromptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           queueTime: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           interTokenLatency: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          itlObservations: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           batchSize: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           ttftP50: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           ttftP95: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
@@ -161,6 +171,7 @@ export function useMetricsHistory(
           e2eP95: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           e2eP99: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           tpot: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          tpotObservations: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           tpotP50: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           tpotP95: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           tpotP99: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
@@ -172,85 +183,108 @@ export function useMetricsHistory(
       const eb = engineBuffersRef.current[key]
       if (engine.metrics) {
         if (engine.metrics.tokens_per_sec !== null) {
-          eb.tps.push({ timestamp: ts, value: engine.metrics.tokens_per_sec })
+          eb.tps.push({
+            timestamp: engineTs,
+            value: engine.metrics.tokens_per_sec,
+            durationMs: engine.metrics.tokens_per_sec_interval_ms ?? 0,
+          })
         }
         if (engine.metrics.avg_tokens_per_sec !== null) {
-          eb.avgTps.push({ timestamp: ts, value: engine.metrics.avg_tokens_per_sec })
+          eb.avgTps.push({ timestamp: engineTs, value: engine.metrics.avg_tokens_per_sec })
         }
         if (engine.metrics.per_request_tps !== null) {
-          eb.perReqTps.push({ timestamp: ts, value: engine.metrics.per_request_tps })
+          eb.perReqTps.push({ timestamp: engineTs, value: engine.metrics.per_request_tps })
         }
         if (engine.metrics.ttft_ms !== null) {
-          eb.ttft.push({ timestamp: ts, value: engine.metrics.ttft_ms })
+          eb.ttft.push({ timestamp: engineTs, value: engine.metrics.ttft_ms })
+        }
+        if (engine.metrics.ttft_observations !== null) {
+          eb.ttftObservations.push({ timestamp: engineTs, value: engine.metrics.ttft_observations })
         }
         if (engine.metrics.kv_cache_percent !== null) {
           eb.kvCache.push({
-            timestamp: ts,
+            timestamp: engineTs,
             value: engine.metrics.kv_cache_percent,
           })
         }
         if (engine.metrics.prefix_cache_hit_rate !== null) {
           eb.prefixCacheHit.push({
-            timestamp: ts,
+            timestamp: engineTs,
             value: engine.metrics.prefix_cache_hit_rate,
           })
         }
         if (engine.metrics.e2e_latency_ms !== null) {
-          eb.e2eLatency.push({ timestamp: ts, value: engine.metrics.e2e_latency_ms })
+          eb.e2eLatency.push({ timestamp: engineTs, value: engine.metrics.e2e_latency_ms })
+        }
+        if (engine.metrics.e2e_observations !== null) {
+          eb.e2eObservations.push({ timestamp: engineTs, value: engine.metrics.e2e_observations })
+        }
+        if (engine.endpoint === 'http://localhost:18300' && engine.metrics.pp_5min != null) {
+          eb.pp.push({ timestamp: engineTs, value: engine.metrics.pp_5min })
         }
         if (engine.metrics.prompt_tokens_per_sec !== null) {
-          eb.promptTps.push({ timestamp: ts, value: engine.metrics.prompt_tokens_per_sec })
+          eb.promptTps.push({
+            timestamp: engineTs,
+            value: engine.metrics.prompt_tokens_per_sec,
+            durationMs: engine.metrics.prompt_tokens_per_sec_interval_ms ?? 0,
+          })
         }
         if (engine.metrics.avg_prompt_tokens_per_sec !== null) {
-          eb.avgPromptTps.push({ timestamp: ts, value: engine.metrics.avg_prompt_tokens_per_sec })
+          eb.avgPromptTps.push({ timestamp: engineTs, value: engine.metrics.avg_prompt_tokens_per_sec })
         }
         if (engine.metrics.per_request_prompt_tps !== null) {
-          eb.perReqPromptTps.push({ timestamp: ts, value: engine.metrics.per_request_prompt_tps })
+          eb.perReqPromptTps.push({ timestamp: engineTs, value: engine.metrics.per_request_prompt_tps })
         }
         if (engine.metrics.queue_time_ms !== null) {
-          eb.queueTime.push({ timestamp: ts, value: engine.metrics.queue_time_ms })
+          eb.queueTime.push({ timestamp: engineTs, value: engine.metrics.queue_time_ms })
         }
         if (engine.metrics.inter_token_latency_ms !== null) {
-          eb.interTokenLatency.push({ timestamp: ts, value: engine.metrics.inter_token_latency_ms })
+          eb.interTokenLatency.push({ timestamp: engineTs, value: engine.metrics.inter_token_latency_ms })
+        }
+        if (engine.metrics.itl_observations !== null) {
+          eb.itlObservations.push({ timestamp: engineTs, value: engine.metrics.itl_observations })
         }
         if (engine.metrics.avg_batch_size !== null) {
-          eb.batchSize.push({ timestamp: ts, value: engine.metrics.avg_batch_size })
+          eb.batchSize.push({ timestamp: engineTs, value: engine.metrics.avg_batch_size })
         }
         if (engine.metrics.tpot_ms !== null) {
-          eb.tpot.push({ timestamp: ts, value: engine.metrics.tpot_ms })
+          eb.tpot.push({ timestamp: engineTs, value: engine.metrics.tpot_ms })
+        }
+        if (engine.metrics.tpot_observations !== null) {
+          eb.tpotObservations.push({ timestamp: engineTs, value: engine.metrics.tpot_observations })
         }
         const tp = engine.metrics.ttft_percentiles
         if (tp) {
-          if (tp.p50_ms !== null) eb.ttftP50.push({ timestamp: ts, value: tp.p50_ms })
-          if (tp.p95_ms !== null) eb.ttftP95.push({ timestamp: ts, value: tp.p95_ms })
-          if (tp.p99_ms !== null) eb.ttftP99.push({ timestamp: ts, value: tp.p99_ms })
+          if (tp.p50_ms !== null) eb.ttftP50.push({ timestamp: engineTs, value: tp.p50_ms })
+          if (tp.p95_ms !== null) eb.ttftP95.push({ timestamp: engineTs, value: tp.p95_ms })
+          if (tp.p99_ms !== null) eb.ttftP99.push({ timestamp: engineTs, value: tp.p99_ms })
         }
         const ip = engine.metrics.itl_percentiles
         if (ip) {
-          if (ip.p50_ms !== null) eb.itlP50.push({ timestamp: ts, value: ip.p50_ms })
-          if (ip.p95_ms !== null) eb.itlP95.push({ timestamp: ts, value: ip.p95_ms })
-          if (ip.p99_ms !== null) eb.itlP99.push({ timestamp: ts, value: ip.p99_ms })
+          if (ip.p50_ms !== null) eb.itlP50.push({ timestamp: engineTs, value: ip.p50_ms })
+          if (ip.p95_ms !== null) eb.itlP95.push({ timestamp: engineTs, value: ip.p95_ms })
+          if (ip.p99_ms !== null) eb.itlP99.push({ timestamp: engineTs, value: ip.p99_ms })
         }
         const ep = engine.metrics.e2e_percentiles
         if (ep) {
-          if (ep.p50_ms !== null) eb.e2eP50.push({ timestamp: ts, value: ep.p50_ms })
-          if (ep.p95_ms !== null) eb.e2eP95.push({ timestamp: ts, value: ep.p95_ms })
-          if (ep.p99_ms !== null) eb.e2eP99.push({ timestamp: ts, value: ep.p99_ms })
+          if (ep.p50_ms !== null) eb.e2eP50.push({ timestamp: engineTs, value: ep.p50_ms })
+          if (ep.p95_ms !== null) eb.e2eP95.push({ timestamp: engineTs, value: ep.p95_ms })
+          if (ep.p99_ms !== null) eb.e2eP99.push({ timestamp: engineTs, value: ep.p99_ms })
         }
         const pp = engine.metrics.tpot_percentiles
         if (pp) {
-          if (pp.p50_ms !== null) eb.tpotP50.push({ timestamp: ts, value: pp.p50_ms })
-          if (pp.p95_ms !== null) eb.tpotP95.push({ timestamp: ts, value: pp.p95_ms })
-          if (pp.p99_ms !== null) eb.tpotP99.push({ timestamp: ts, value: pp.p99_ms })
+          if (pp.p50_ms !== null) eb.tpotP50.push({ timestamp: engineTs, value: pp.p50_ms })
+          if (pp.p95_ms !== null) eb.tpotP95.push({ timestamp: engineTs, value: pp.p95_ms })
+          if (pp.p99_ms !== null) eb.tpotP99.push({ timestamp: engineTs, value: pp.p99_ms })
         }
         if (engine.metrics.active_requests !== null) {
-          eb.activeRequests.push({ timestamp: ts, value: engine.metrics.active_requests })
+          eb.activeRequests.push({ timestamp: engineTs, value: engine.metrics.active_requests })
         }
         if (engine.metrics.queued_requests !== null) {
-          eb.queuedRequests.push({ timestamp: ts, value: engine.metrics.queued_requests })
+          eb.queuedRequests.push({ timestamp: engineTs, value: engine.metrics.queued_requests })
         }
         if (engine.metrics.total_requests !== null) {
-          eb.totalRequests.push({ timestamp: ts, value: engine.metrics.total_requests })
+          eb.totalRequests.push({ timestamp: engineTs, value: engine.metrics.total_requests })
         }
       }
 

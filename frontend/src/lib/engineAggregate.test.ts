@@ -5,22 +5,27 @@ import type { EngineMetrics, EngineSnapshot, EngineStatus } from '@/types/metric
 function fullMetrics(overrides: Partial<EngineMetrics> = {}): EngineMetrics {
   return {
     tokens_per_sec: 100,
+    tokens_per_sec_interval_ms: 1000,
     avg_tokens_per_sec: 80,
     per_request_tps: 50,
     ttft_ms: 120,
+    ttft_observations: 10,
     active_requests: 2,
     queued_requests: 1,
     kv_cache_percent: 40,
     kv_cache_is_estimated: false,
     total_requests: 10,
     e2e_latency_ms: 500,
+    e2e_observations: 10,
     prompt_tokens_per_sec: 200,
+    prompt_tokens_per_sec_interval_ms: 1000,
     avg_prompt_tokens_per_sec: 180,
     per_request_prompt_tps: 70,
     swapped_requests: 0,
     prefix_cache_hit_rate: 30,
     queue_time_ms: 50,
     inter_token_latency_ms: 25,
+    itl_observations: 100,
     preemptions_total: 0,
     total_prompt_tokens: 1000,
     total_generation_tokens: 2000,
@@ -36,6 +41,7 @@ function fullMetrics(overrides: Partial<EngineMetrics> = {}): EngineMetrics {
     itl_buckets: null,
     e2e_buckets: null,
     tpot_ms: 28,
+    tpot_observations: 100,
     tpot_percentiles: null,
     tpot_goodput_pct: null,
     tpot_buckets: null,
@@ -60,6 +66,7 @@ function engine(
     status: status === 'Error' ? { type: 'Error', message: 'boom' } : { type: status },
     model: { name: 'test/model', parameter_size: null, quantization: null, precision: null, tensor_type: null, model_type: null, pipeline_tag: null },
     metrics,
+    sampled_at_ms: metrics ? 1000 : null,
     recent_requests: [],
     deployment_mode: 'Docker',
   }
@@ -195,23 +202,43 @@ describe('aggregateEngines', () => {
     expect(snap.spec_decode_mean_acceptance_length).toBeNull()
   })
 
-  it('weighted mean for latencies uses total_requests as the weight', () => {
+  it('weighted mean for latencies uses matching observation counts', () => {
     // Engine A: ttft 100ms, 10 requests; Engine B: ttft 500ms, 90 requests
     // Weighted mean = (100*10 + 500*90) / 100 = 460
     const engines = [
-      engine('Running', fullMetrics({ ttft_ms: 100, total_requests: 10 })),
-      engine('Running', fullMetrics({ ttft_ms: 500, total_requests: 90 })),
+      engine('Running', fullMetrics({ ttft_ms: 100, ttft_observations: 10 })),
+      engine('Running', fullMetrics({ ttft_ms: 500, ttft_observations: 90 })),
     ]
     const snap = aggregateEngines(engines)
     expect(snap.ttft_ms).toBeCloseTo(460, 5)
+  })
+
+  it('weights each fleet latency and goodput by its matching histogram observations', () => {
+    const engines = [
+      engine('Running', fullMetrics({
+        total_requests: 1_000,
+        ttft_ms: 100,
+        ttft_observations: 1,
+        ttft_goodput_pct: 100,
+      })),
+      engine('Running', fullMetrics({
+        total_requests: 1,
+        ttft_ms: 500,
+        ttft_observations: 9,
+        ttft_goodput_pct: 0,
+      })),
+    ]
+    const snap = aggregateEngines(engines)
+    expect(snap.ttft_ms).toBe(460)
+    expect(snap.ttft_goodput_pct).toBe(10)
   })
 
   it('weighted mean applies to inter-token latency', () => {
     // Engine A: ITL 20ms, 10 requests; Engine B: ITL 80ms, 40 requests
     // Weighted mean = (20*10 + 80*40) / 50 = 68
     const engines = [
-      engine('Running', fullMetrics({ inter_token_latency_ms: 20, total_requests: 10 })),
-      engine('Running', fullMetrics({ inter_token_latency_ms: 80, total_requests: 40 })),
+      engine('Running', fullMetrics({ inter_token_latency_ms: 20, itl_observations: 10 })),
+      engine('Running', fullMetrics({ inter_token_latency_ms: 80, itl_observations: 40 })),
     ]
     const snap = aggregateEngines(engines)
     expect(snap.inter_token_latency_ms).toBeCloseTo(68, 5)
@@ -235,14 +262,28 @@ describe('aggregateEngines', () => {
     expect(snap.ttft_ms).toBe(200)
   })
 
-  it('simple mean for KV cache percent (not a sum)', () => {
-    const engines = [
+  it('shows KV cache use only when one engine supplies the denominator', () => {
+    expect(aggregateEngines([
       engine('Running', fullMetrics({ kv_cache_percent: 30 })),
-      engine('Running', fullMetrics({ kv_cache_percent: 60 })),
+    ]).kv_cache_percent).toBe(30)
+    expect(aggregateEngines([
+      engine('Running', fullMetrics({ kv_cache_percent: 30 })),
       engine('Running', fullMetrics({ kv_cache_percent: 90 })),
-    ]
-    const snap = aggregateEngines(engines)
-    expect(snap.kv_cache_percent).toBe(60)
+    ]).kv_cache_percent).toBeNull()
+  })
+
+  it('weights fleet prefix-cache hit rate by query volume', () => {
+    const snap = aggregateEngines([
+      engine('Running', fullMetrics({
+        prefix_cache_hit_rate: 90,
+        prefix_cache_queries_total: 900,
+      })),
+      engine('Running', fullMetrics({
+        prefix_cache_hit_rate: 10,
+        prefix_cache_queries_total: 100,
+      })),
+    ])
+    expect(snap.prefix_cache_hit_rate).toBe(82)
   })
 
   it('skips null metric fields when aggregating', () => {
@@ -297,6 +338,7 @@ function engineWithModel(
     status: status === 'Error' ? { type: 'Error', message: 'boom' } : { type: status },
     model: modelName === null ? null : { name: modelName, parameter_size: null, quantization: null, precision: null, tensor_type: null, model_type: null, pipeline_tag: null },
     metrics: null,
+    sampled_at_ms: null,
     recent_requests: [],
     deployment_mode: 'Docker',
   }

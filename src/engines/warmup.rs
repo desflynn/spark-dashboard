@@ -185,19 +185,17 @@ fn clone_passthrough(parsed: &ParsedMetrics) -> ParsedMetrics {
     }
 }
 
-/// Returns true if any baselined counter has dropped below its baseline value
-/// — the canonical "engine restarted" signal. We compare every baselined key,
-/// not just the trigger, because a partial restart that resets only some
-/// counters is still a restart and still warrants re-baselining.
+/// Returns true if the request-count trigger has dropped below its baseline.
+/// Other metric names may represent multiple labelled series; the parser
+/// collapses those to one value, so comparing them can report false regressions.
 fn counter_regression(parsed: &ParsedMetrics, baseline: &HistogramBaseline) -> bool {
-    for (key, baseline_val) in &baseline.counters {
-        if let Some(current) = parsed.counters.get(key) {
-            if *current < *baseline_val {
-                return true;
-            }
-        }
-    }
-    false
+    matches!(
+        (
+            parsed.counters.get(TRIGGER_COUNT_KEY),
+            baseline.counters.get(TRIGGER_COUNT_KEY),
+        ),
+        (Some(current), Some(baseline)) if current < baseline
+    )
 }
 
 /// Compute `parsed - baseline` for every counter and histogram while leaving
@@ -447,6 +445,32 @@ mod tests {
             WarmupState::Warming { initial_total } => assert_eq!(*initial_total, Some(1)),
             _ => panic!("should be warming again"),
         }
+    }
+
+    #[test]
+    fn non_trigger_counter_regression_does_not_reset_baseline() {
+        let mut t = WarmupTracker::new(0);
+        let _ = t.observe(&metrics(
+            &[
+                (TRIGGER_COUNT_KEY, 5.0),
+                ("vllm_request_success_total", 3.0),
+            ],
+            &[],
+            &[],
+        ));
+
+        let out = t.observe(&metrics(
+            &[
+                (TRIGGER_COUNT_KEY, 6.0),
+                ("vllm_request_success_total", 0.0),
+            ],
+            &[],
+            &[],
+        ));
+
+        assert!(!out.warming_up);
+        assert!(!out.just_transitioned);
+        assert!(matches!(t.state, WarmupState::Active { .. }));
     }
 
     #[test]
