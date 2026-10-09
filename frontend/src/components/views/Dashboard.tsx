@@ -7,6 +7,7 @@ import { AreaSparkline } from '@/components/charts/AreaSparkline'
 import { Sparkline } from '@/components/charts/Sparkline'
 import { aggregateEngines } from '@/lib/engineAggregate'
 import { engineKey, findEngineByKey, gpuIndexOf, snapshotGpus } from '@/lib/identity'
+import { engineDisplayOverride, orderEnginesForDisplay } from '@/lib/engineDisplay'
 import { formatCompactTokens, formatGiB, formatMhz, fmtInt } from '@/lib/format'
 import { THRESHOLDS } from '@/lib/theme'
 import { useSloSettings } from '@/hooks/useSloSettings'
@@ -416,7 +417,7 @@ export function Dashboard({
 }: DashboardProps) {
   // Engines (empty when no snapshot yet). Computed before the early return so
   // the hook below can be called unconditionally.
-  const engines = metrics?.engines ?? []
+  const engines = orderEnginesForDisplay(metrics?.engines ?? [])
 
   // The effective engine for the current tab. A stale key (not present) falls
   // back to the All view.
@@ -1056,7 +1057,7 @@ export function Dashboard({
               return (
                 <ModelRow
                   key={key}
-                  name={engine.model?.name ?? key}
+                  name={engineDisplayOverride(engine) ?? engine.model?.name ?? key}
                   meta={metaParts.join(' · ')}
                   pp={fmtOptional(ppMeanE)}
                   tg={fmtOptional(tgMeanE)}

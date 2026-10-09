@@ -20,6 +20,7 @@ import {
 import { aggregateEngines, groupRunningByProvider } from '@/lib/engineAggregate'
 import { engineDisplayName, formatGpuIndexes } from '@/lib/format'
 import { engineKey, findEngineByKey } from '@/lib/identity'
+import { engineDisplayOverride, orderEnginesForDisplay } from '@/lib/engineDisplay'
 import { getProviderLogo } from '@/lib/providerLogo'
 import { useTabRotation } from '@/hooks/useTabRotation'
 import type { EngineSnapshot, EngineType, DeploymentMode } from '@/types/metrics'
@@ -135,7 +136,7 @@ interface EngineSectionProps {
 }
 
 export function EngineSection({
-  engines,
+  engines: incomingEngines,
   showCharts = false,
   collapseCharts = false,
   getChartData,
@@ -144,6 +145,7 @@ export function EngineSection({
   onActiveEngineChange,
   onActiveEngineGpuChange,
 }: EngineSectionProps) {
+  const engines = useMemo(() => orderEnginesForDisplay(incomingEngines), [incomingEngines])
   const [activeTab, setActiveTab] = useState<string>(() => {
     if (typeof window === 'undefined') return GLOBAL_TAB_VALUE
     try {
@@ -333,7 +335,7 @@ export function EngineSection({
 
   const headerTitle = isGlobal
     ? 'All Engines'
-    : activeEngine?.model?.name ?? 'No Model Loaded'
+    : (activeEngine && engineDisplayOverride(activeEngine)) ?? activeEngine?.model?.name ?? 'No Model Loaded'
 
   const headerProviderLogo = !isGlobal ? getProviderLogo(activeEngine?.model?.name) : null
 

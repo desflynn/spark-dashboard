@@ -1,6 +1,7 @@
 import { TabsTrigger } from '@/components/ui/tabs'
 import { engineDisplayName } from '@/lib/format'
 import { engineKey } from '@/lib/identity'
+import { engineDisplayOverride } from '@/lib/engineDisplay'
 import { getProviderLogo } from '@/lib/providerLogo'
 import type { EngineSnapshot } from '@/types/metrics'
 
@@ -43,9 +44,9 @@ export function EngineTab({ engine, cycle, intervalMs, showCountdown }: EngineTa
   const isDocker = engine.deployment_mode === 'Docker'
   const modeLabel = isDocker ? 'Docker' : 'Direct'
 
-  const instanceLabel = engine.model?.name
+  const instanceLabel = engineDisplayOverride(engine) ?? (engine.model?.name
     ? shortenModelName(engine.model.name)
-    : portFromEndpoint(engine.endpoint) ?? displayName
+    : portFromEndpoint(engine.endpoint) ?? displayName)
 
   const providerLogo = getProviderLogo(engine.model?.name)
 
