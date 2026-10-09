@@ -12,6 +12,7 @@ const engine = (
   status: { type: 'Running' },
   model: null,
   metrics: null,
+  sampled_at_ms: null,
   recent_requests: [],
   deployment_mode: mode,
   gpu_indexes: [],
@@ -58,7 +59,7 @@ class MockWebSocket {
 
 /** Expand the console (which lazily opens the socket) and return the socket. */
 function expand(): MockWebSocket {
-  fireEvent.click(screen.getByText('▶ Console Logs'))
+  fireEvent.click(screen.getByRole('button', { name: /Console/ }))
   expect(MockWebSocket.instances.length).toBeGreaterThan(0)
   return MockWebSocket.instances[MockWebSocket.instances.length - 1]
 }
@@ -75,15 +76,15 @@ describe('LogViewer', () => {
 
   it('renders collapsed by default', () => {
     render(<LogViewer />)
-    expect(screen.getByText('▶ Console Logs')).toBeDefined()
-    // Should not show the expanded log panel
-    expect(screen.queryByText('▼ Console Logs')).toBeNull()
+    expect(screen.getByRole('button', { name: /Console/ })).toBeDefined()
+    // The expanded panel's live-state control must be absent while collapsed.
+    expect(screen.queryByText('⏵ Live')).toBeNull()
   })
 
   it('does not open a socket while collapsed (lazy connect)', () => {
     render(<LogViewer />)
     expect(MockWebSocket.instances).toHaveLength(0)
-    expect(screen.getByText('click to stream')).toBeDefined()
+    expect(screen.getByRole('button', { name: /Console/ })).toBeDefined()
   })
 
   it('connects on first expand', () => {
@@ -97,9 +98,10 @@ describe('LogViewer', () => {
     render(<LogViewer />)
     const ws = expand()
     act(() => ws.connect())
-    fireEvent.click(screen.getByText('▼ Console Logs'))
+    fireEvent.click(screen.getByRole('button', { name: /Console/ }))
     expect(ws.readyState).toBe(3)
-    expect(screen.getByText('▶ Console Logs')).toBeDefined()
+    expect(screen.getByRole('button', { name: /Console/ })).toBeDefined()
+    expect(screen.queryByText('⏵ Live')).toBeNull()
   })
 
   it('shows live state when connected', () => {
@@ -218,6 +220,7 @@ describe('LogViewer', () => {
       />,
     )
     const ws = expand()
+    expect(screen.getByText('http://localhost:8100')).toBeDefined()
     expect(ws.url).toContain(
       `/ws/logs?engine=${encodeURIComponent('http://localhost:8100')}`,
     )

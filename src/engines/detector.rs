@@ -274,32 +274,65 @@ fn parse_model_from_args(args: &[OsString]) -> Option<String> {
         .iter()
         .filter_map(|a| a.to_str().map(String::from))
         .collect();
+    parse_model_from_arg_strs(&args)
+}
 
-    // First pass: explicit --model flag.
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--model" {
-            if let Some(val) = args.get(i + 1) {
-                if !val.is_empty() && !val.starts_with('-') {
-                    return Some(val.clone());
+/// Shared arg-list walker used by both the OsString path (Linux `procfs`
+/// discovery) and the pre-joined string path (Docker `Config.Cmd`).
+///
+/// Precedence, HIGHEST → LOWEST:
+/// 1. `--served-model-name X` / `--served-model-name=X` — what the operator
+///    explicitly wants callers to name the model. This must beat every other
+///    candidate, otherwise a filesystem-path positional argument beats the
+///    intended id (the qwen38-flash-autoround case that motivated this fix —
+///    see `experiments/spark-dashboard-uncached-pp/PLAN.md`).
+/// 2. `--model X` / `--model=X`.
+/// 3. Positional `<id>` after a `serve` token following a vLLM entrypoint.
+///
+/// Every candidate is rejected if it starts with `/`: a leading slash makes
+/// it a filesystem path, not a Hugging Face `Org/Model` id. Downstream
+/// precedence in `VllmAdapter::get_model_info` treats any string containing
+/// `/` as an HF slug, so accepting a path here silently poisons the card.
+fn parse_model_from_arg_strs(args: &[String]) -> Option<String> {
+    fn accept(v: &str) -> Option<String> {
+        if v.is_empty() || v.starts_with('-') || v.starts_with('/') {
+            None
+        } else {
+            Some(v.to_string())
+        }
+    }
+    fn scan_flag(args: &[String], flag: &str) -> Option<String> {
+        let flag_eq = format!("{flag}=");
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == flag {
+                if let Some(val) = args.get(i + 1) {
+                    if let Some(v) = accept(val) {
+                        return Some(v);
+                    }
+                }
+            } else if let Some(val) = args[i].strip_prefix(&flag_eq) {
+                if let Some(v) = accept(val) {
+                    return Some(v);
                 }
             }
-        } else if let Some(val) = args[i].strip_prefix("--model=") {
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
+            i += 1;
         }
-        i += 1;
+        None
     }
-
-    // Second pass: positional `serve <id>` after a vllm entrypoint token.
+    if let Some(v) = scan_flag(args, "--served-model-name") {
+        return Some(v);
+    }
+    if let Some(v) = scan_flag(args, "--model") {
+        return Some(v);
+    }
+    // Positional `serve <id>` after a vLLM entrypoint token.
     for (idx, arg) in args.iter().enumerate() {
         let is_vllm_entry =
             arg == "vllm" || arg.ends_with("/vllm") || arg.contains("vllm.entrypoints");
         if !is_vllm_entry {
             continue;
         }
-        // Find the `serve` subcommand after the entrypoint token.
         if let Some(serve_idx) = args.iter().enumerate().skip(idx + 1).find_map(|(j, a)| {
             if a == "serve" {
                 Some(j)
@@ -308,13 +341,12 @@ fn parse_model_from_args(args: &[OsString]) -> Option<String> {
             }
         }) {
             if let Some(val) = args.get(serve_idx + 1) {
-                if !val.is_empty() && !val.starts_with('-') {
-                    return Some(val.clone());
+                if let Some(v) = accept(val) {
+                    return Some(v);
                 }
             }
         }
     }
-
     None
 }
 
@@ -326,46 +358,8 @@ fn parse_model_from_args(args: &[OsString]) -> Option<String> {
 /// tests exercise it on every platform — hence the `test` cfg.
 #[cfg(any(target_os = "linux", test))]
 fn parse_model_from_command_str(cmd: &str) -> Option<String> {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-
-    // First pass: explicit --model flag.
-    for (i, part) in parts.iter().enumerate() {
-        if *part == "--model" {
-            if let Some(val) = parts.get(i + 1) {
-                if !val.is_empty() && !val.starts_with('-') {
-                    return Some((*val).to_string());
-                }
-            }
-        } else if let Some(val) = part.strip_prefix("--model=") {
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
-        }
-    }
-
-    // Second pass: positional `serve <id>` after a vllm entrypoint token.
-    for (idx, part) in parts.iter().enumerate() {
-        let is_vllm_entry =
-            *part == "vllm" || part.ends_with("/vllm") || part.contains("vllm.entrypoints");
-        if !is_vllm_entry {
-            continue;
-        }
-        if let Some(serve_idx) = parts.iter().enumerate().skip(idx + 1).find_map(|(j, a)| {
-            if *a == "serve" {
-                Some(j)
-            } else {
-                None
-            }
-        }) {
-            if let Some(val) = parts.get(serve_idx + 1) {
-                if !val.is_empty() && !val.starts_with('-') {
-                    return Some((*val).to_string());
-                }
-            }
-        }
-    }
-
-    None
+    let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+    parse_model_from_arg_strs(&parts)
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +643,80 @@ mod tests {
     fn returns_none_when_serve_has_no_positional() {
         let args = to_args(&["vllm", "serve"]);
         assert_eq!(parse_model_from_args(&args), None);
+    }
+
+    /// Real running-container argv for qwen38-flash-autoround
+    /// (captured 2026-08-29): the `vllm serve` positional is a filesystem
+    /// path to the model snapshot, and `--served-model-name` carries the
+    /// operator-intended id. Before the fix the parser returned the path,
+    /// which vllm.rs precedence then treats as an HF `Org/Model` slug (the
+    /// bug in `experiments/spark-dashboard-uncached-pp/PLAN.md`).
+    #[test]
+    fn served_model_name_wins_over_positional_path() {
+        let args = to_args(&[
+            "vllm",
+            "serve",
+            "/model/snapshots/8b82f0b7abe3d1150a7827d298c75e86267636ae",
+            "--served-model-name",
+            "qwen3.8-flash-next",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8000",
+        ]);
+        assert_eq!(
+            parse_model_from_args(&args).as_deref(),
+            Some("qwen3.8-flash-next"),
+        );
+    }
+
+    /// Precedence: `--served-model-name` beats an explicit `--model` too.
+    #[test]
+    fn served_model_name_wins_over_model_flag() {
+        let args = to_args(&[
+            "vllm",
+            "serve",
+            "--model",
+            "unsloth/Llama-3.2-1B-Instruct",
+            "--served-model-name",
+            "friendly-alias",
+        ]);
+        assert_eq!(
+            parse_model_from_args(&args).as_deref(),
+            Some("friendly-alias"),
+        );
+    }
+
+    /// A `/`-prefixed value on either flag is rejected — a leading slash
+    /// makes it a filesystem path, not a Hugging Face id. Rejecting here
+    /// lets the parser fall through to the next candidate rather than
+    /// poison downstream HF-slug heuristics.
+    #[test]
+    fn rejects_leading_slash_values() {
+        let args = to_args(&[
+            "vllm",
+            "serve",
+            "--served-model-name",
+            "/etc/passwd",
+            "--model",
+            "/some/local/path",
+        ]);
+        assert_eq!(parse_model_from_args(&args), None);
+    }
+
+    /// Equals-form of `--served-model-name` is handled too.
+    #[test]
+    fn served_model_name_equals_form() {
+        let args = to_args(&[
+            "vllm",
+            "serve",
+            "/model/snapshots/aaa",
+            "--served-model-name=qwen3.8-flash-next",
+        ]);
+        assert_eq!(
+            parse_model_from_args(&args).as_deref(),
+            Some("qwen3.8-flash-next"),
+        );
     }
 
     #[test]

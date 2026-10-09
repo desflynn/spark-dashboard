@@ -55,4 +55,13 @@ describe('ArcGauge', () => {
     )
     expect(screen.getByText('Memory')).toBeDefined()
   })
+
+  it('renders missing telemetry as unknown rather than a zero-value arc', () => {
+    const { container } = render(
+      <ArcGauge label="GPU Util" unit="%" />,
+    )
+
+    expect(screen.getByText('—')).toBeDefined()
+    expect(container.querySelector('[data-testid="arc-value"]')).toBeNull()
+  })
 })
