@@ -44,6 +44,10 @@ COPY src/ ./src/
 # the Dockerfile/compose files don't bust this layer's cache.
 COPY deploy/host/systemd ./deploy/host/systemd
 COPY deploy/host/config.env.example ./deploy/host/config.env.example
+# src/deploy_files.rs include_str!s the Dockerfile and Compose file at compile
+# time; without these copies the builder cannot compile its own deploy-drift
+# tests.
+COPY deploy/docker ./deploy/docker
 COPY --from=frontend /app/frontend/dist ./frontend/dist/
 RUN cargo build --release --locked
 # Skeleton for the runtime's state directory. It has to be built here because
