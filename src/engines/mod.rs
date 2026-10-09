@@ -109,13 +109,27 @@ pub struct EngineMetrics {
     /// Average end-to-end request latency in milliseconds.
     pub e2e_latency_ms: Option<f64>,
     pub e2e_observations: Option<u64>,
-    /// Prompt (prefill) token throughput (tokens/sec), computed as rate from counter.
-    pub prompt_tokens_per_sec: Option<f64>,
-    pub prompt_tokens_per_sec_interval_ms: Option<u64>,
-    /// Running average of prompt (prefill) token throughput (tokens/sec).
-    pub avg_prompt_tokens_per_sec: Option<f64>,
-    /// Per-request average prompt throughput: prompt_tokens / prefill_time (tokens/sec).
-    pub per_request_prompt_tps: Option<f64>,
+    /// Uncached prefill throughput (tok/s) for the MOST RECENTLY completed
+    /// request. Sourced from paired
+    /// `vllm:request_prefill_kv_computed_tokens_sum` /
+    /// `vllm:request_prefill_time_seconds_sum` deltas at completion.
+    /// Persists across idle — the card's "Last Req" cell keeps showing the
+    /// previous request until a new one completes.
+    pub last_req_pp: Option<f64>,
+    /// Uncached prefill throughput (tok/s) over the last 5 minutes, as
+    /// `Σ Δtok / Σ Δsec` across every request completed in the window. `None`
+    /// when the window has no completed requests — the card shows `—`, never 0.
+    pub pp_5min: Option<f64>,
+    /// Uncached prefill throughput (tok/s) over the engine's lifetime, as
+    /// `kv_computed_tokens_sum / prefill_time_seconds_sum`.
+    pub pp_lifetime: Option<f64>,
+    /// Cumulative uncached (compute-path) prefill tokens since engine start.
+    /// Equal to `prompt_tokens_by_source_total{source="local_compute"}`.
+    pub pure_prefill_tokens: Option<u64>,
+    /// Decode throughput (tok/s) for the MOST RECENTLY completed request,
+    /// derived from paired `vllm:request_generation_tokens_sum` /
+    /// `vllm:request_decode_time_seconds_sum` deltas.
+    pub last_req_tg: Option<f64>,
     /// Number of requests swapped to CPU memory (0 = healthy, >0 = memory pressure).
     pub swapped_requests: Option<u64>,
     /// GPU prefix cache hit rate as percentage (0-100).

@@ -7,8 +7,39 @@ use super::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/// Snapshot of the paired prefill histograms read on one scrape. Deltas
+/// between consecutive snapshots (with `pt_count` strictly increasing) give
+/// per-request uncached prefill work.
+#[derive(Clone, Copy, Debug)]
+struct PrefillSample {
+    pkc_sum: f64,
+    pt_sum: f64,
+    /// Strictly-increasing observation counter. Any tick where it moves is a
+    /// completion event (single request when it moves by 1; batched when >1).
+    pt_count: u64,
+}
+
+/// Same shape for the paired decode histograms.
+#[derive(Clone, Copy, Debug)]
+struct DecodeSample {
+    gen_sum: f64,
+    dt_sum: f64,
+    dt_count: u64,
+}
+
+/// One ring entry recording the (Δtokens, Δseconds) of one completion event.
+/// The 5-min headline sums both across the ring and divides — active-time
+/// weighted by construction (idle time contributes zero of both).
+#[derive(Clone, Copy, Debug)]
+struct PpSample {
+    at: Instant,
+    dtok: f64,
+    dsec: f64,
+}
 
 /// Default number of requests to skip on engine startup before baselining.
 /// vLLM's first inference is dominated by CUDA kernel JIT and KV cache
@@ -81,16 +112,27 @@ pub struct VllmAdapter {
     served_model: Option<String>,
     /// Previous generation_tokens_total counter reading for rate computation.
     prev_gen_tokens: Mutex<Option<(f64, Instant)>>,
-    /// Previous prompt_tokens_total counter reading for rate computation.
-    prev_prompt_tokens: Mutex<Option<(f64, Instant)>>,
+    /// Previous scrape's paired prefill histogram snapshot. Used to detect
+    /// request completions (pt_count increment) and derive their uncached
+    /// prefill rate.
+    prev_prefill: Mutex<Option<PrefillSample>>,
+    /// Previous scrape's paired decode histogram snapshot. Same role for TG
+    /// per-request rate.
+    prev_decode: Mutex<Option<DecodeSample>>,
+    /// 5-minute ring of completion-event (Δtok, Δsec) samples for the
+    /// headline PP rate.
+    pp_ring: Mutex<VecDeque<PpSample>>,
+    /// Most recently observed per-request uncached prefill rate. Persists
+    /// across idle so the "Last Req" cell keeps a real value between requests.
+    last_req_pp: Mutex<Option<f64>>,
+    /// Same, for per-request decode rate.
+    last_req_tg: Mutex<Option<f64>>,
     /// Previous (accepted, draft) spec-decode counter readings, used to compute
     /// the live (windowed) token acceptance rate from per-poll deltas. No
     /// timestamp is stored because the live TAR is a unit-free ratio of deltas.
     prev_spec_decode: Mutex<Option<(f64, f64)>>,
     /// Running average for generation: (sum_of_tps_readings, count_of_readings)
     avg_accum: Mutex<(f64, u64)>,
-    /// Running average for prompt: (sum_of_tps_readings, count_of_readings)
-    avg_prompt_accum: Mutex<(f64, u64)>,
     /// Warmup baseline tracker — drops the first `SPARK_WARMUP_SKIP_REQUESTS`
     /// observations from histogram-derived metrics so the slow first inference
     /// does not skew steady-state percentiles and averages.
@@ -129,10 +171,13 @@ impl VllmAdapter {
             api_key,
             served_model,
             prev_gen_tokens: Mutex::new(None),
-            prev_prompt_tokens: Mutex::new(None),
+            prev_prefill: Mutex::new(None),
+            prev_decode: Mutex::new(None),
+            pp_ring: Mutex::new(VecDeque::new()),
+            last_req_pp: Mutex::new(None),
+            last_req_tg: Mutex::new(None),
             prev_spec_decode: Mutex::new(None),
             avg_accum: Mutex::new((0.0, 0)),
-            avg_prompt_accum: Mutex::new((0.0, 0)),
             warmup: Mutex::new(WarmupTracker::new(warmup_skip_from_env())),
             hf_model_cache: Mutex::new(None),
             last_hf_error: Mutex::new(None),
@@ -447,10 +492,13 @@ impl EngineAdapter for VllmAdapter {
         // depends on the previous reading before computing rates below.
         if warmup_out.just_transitioned {
             *self.prev_gen_tokens.lock().await = None;
-            *self.prev_prompt_tokens.lock().await = None;
+            *self.prev_prefill.lock().await = None;
+            *self.prev_decode.lock().await = None;
+            self.pp_ring.lock().await.clear();
+            *self.last_req_pp.lock().await = None;
+            *self.last_req_tg.lock().await = None;
             *self.prev_spec_decode.lock().await = None;
             *self.avg_accum.lock().await = (0.0, 0);
-            *self.avg_prompt_accum.lock().await = (0.0, 0);
             tracing::info!(
                 endpoint = %self.endpoint,
                 "warmup complete — baseline captured, steady-state metrics now reported"
@@ -540,22 +588,8 @@ impl EngineAdapter for VllmAdapter {
             rate
         };
 
-        // Prompt tokens/sec from prompt_tokens_total counter (rate = delta / elapsed)
-        let current_prompt = parsed.counters.get("vllm_prompt_tokens_total").copied();
+        // Total prompt tokens (kept for the "Total (incl. cache)" cell).
         let total_prompt = raw.counters.get("vllm_prompt_tokens_total").copied();
-        let (prompt_tokens_per_sec, prompt_tokens_per_sec_interval_ms) = {
-            let mut prev_lock = self.prev_prompt_tokens.lock().await;
-            let rate = match (current_prompt, prev_lock.as_ref()) {
-                (Some(current), Some(&(prev_val, prev_time))) => {
-                    counter_rate(current, prev_val, now.duration_since(prev_time))
-                }
-                _ => (None, None),
-            };
-            if let Some(val) = current_prompt {
-                *prev_lock = Some((val, now));
-            }
-            rate
-        };
 
         // Avg TPS = sum of non-zero TPS readings / count of readings.
         // Only accumulates when there's actual throughput. Stays stable when idle.
@@ -574,31 +608,133 @@ impl EngineAdapter for VllmAdapter {
             }
         };
 
-        // Avg prompt TPS (same pattern as generation avg)
-        let avg_prompt_tokens_per_sec = {
-            let mut accum = self.avg_prompt_accum.lock().await;
-            if let Some(tps) = prompt_tokens_per_sec {
-                if tps > 0.0 {
-                    accum.0 += tps;
-                    accum.1 += 1;
-                }
-            }
-            if accum.1 > 0 {
-                Some(accum.0 / accum.1 as f64)
-            } else {
-                None
+        // === Uncached PP: per-request completion-time derivation ===
+        //
+        // `vllm:prompt_tokens_total` and `vllm:iteration_tokens_total` only
+        // increment at request completion in this vLLM build (verified
+        // 2026-08-29, evidence/2026-08-29-uncached-pp.md), so per-scrape rate
+        // deltas are useless — they yield zero mid-prefill and a spike at
+        // completion. Instead, watch the paired histograms
+        // `vllm:request_prefill_kv_computed_tokens_{sum,count}` and
+        // `vllm:request_prefill_time_seconds_{sum,count}`. Both observe at
+        // request completion and land in the SAME scrape (probe confirmed),
+        // so the ratio of their deltas is an honest per-request uncached
+        // prefill rate.
+        //
+        // Ring of (at, Δtok, Δsec) samples pruned to the last 5 min feeds the
+        // "5-min" headline; `last_req_pp` is the most recent sample's ratio
+        // and persists through idle.
+        // Read from `raw` (not `parsed`) so cumulative fields are pass-through
+        // and don't get zeroed if warmup baselines the histograms at a value
+        // that already includes prior requests. Deltas are unaffected:
+        // (raw_curr − raw_prev) == (adj_curr − adj_prev).
+        let curr_prefill = {
+            let pkc_sum = raw
+                .counters
+                .get("vllm_request_prefill_kv_computed_tokens_sum")
+                .copied();
+            let pt_sum = raw
+                .counters
+                .get("vllm_request_prefill_time_seconds_sum")
+                .copied();
+            let pt_count = raw
+                .counters
+                .get("vllm_request_prefill_time_seconds_count")
+                .copied();
+            match (pkc_sum, pt_sum, pt_count) {
+                (Some(a), Some(c), Some(d)) => Some(PrefillSample {
+                    pkc_sum: a,
+                    pt_sum: c,
+                    pt_count: d as u64,
+                }),
+                _ => None,
             }
         };
 
-        // Per-request prompt TPS: prompt_tokens_total / ttft_total_seconds
-        // Approximates average prefill throughput per request
-        let per_request_prompt_tps = {
-            let prompt_total = parsed.counters.get("vllm_prompt_tokens_total");
-            let ttft_sum = parsed.counters.get("vllm_time_to_first_token_seconds_sum");
-            match (prompt_total, ttft_sum) {
-                (Some(&p), Some(&t)) if t > 0.0 => Some(p / t),
+        let (last_req_pp, pp_5min) = {
+            let mut prev = self.prev_prefill.lock().await;
+            let mut ring = self.pp_ring.lock().await;
+            let mut last = self.last_req_pp.lock().await;
+            if let (Some(cur), Some(pv)) = (curr_prefill, *prev) {
+                if let Some((dtok, dsec)) = detect_pp_completion(pv, cur) {
+                    ring.push_back(PpSample {
+                        at: now,
+                        dtok,
+                        dsec,
+                    });
+                    *last = Some(dtok / dsec);
+                }
+            }
+            let cutoff = now.checked_sub(Duration::from_secs(300));
+            if let Some(cutoff) = cutoff {
+                while let Some(front) = ring.front() {
+                    if front.at < cutoff {
+                        ring.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if curr_prefill.is_some() {
+                *prev = curr_prefill;
+            }
+            let pp_5min = if ring.is_empty() {
+                None
+            } else {
+                let (t, s) = ring
+                    .iter()
+                    .fold((0.0_f64, 0.0_f64), |(t, s), r| (t + r.dtok, s + r.dsec));
+                if s > 0.0 {
+                    Some(t / s)
+                } else {
+                    None
+                }
+            };
+            (*last, pp_5min)
+        };
+
+        let pp_lifetime = curr_prefill.and_then(pp_lifetime_rate);
+        let pure_prefill_tokens = curr_prefill.map(|s| s.pkc_sum as u64);
+
+        // === TG last-req (per-request decode rate) ===
+        let curr_decode = {
+            let gen_sum = raw
+                .counters
+                .get("vllm_request_generation_tokens_sum")
+                .copied();
+            let dt_sum = raw
+                .counters
+                .get("vllm_request_decode_time_seconds_sum")
+                .copied();
+            let dt_count = raw
+                .counters
+                .get("vllm_request_decode_time_seconds_count")
+                .copied();
+            match (gen_sum, dt_sum, dt_count) {
+                (Some(a), Some(c), Some(d)) => Some(DecodeSample {
+                    gen_sum: a,
+                    dt_sum: c,
+                    dt_count: d as u64,
+                }),
                 _ => None,
             }
+        };
+        let last_req_tg = {
+            let mut prev = self.prev_decode.lock().await;
+            let mut last = self.last_req_tg.lock().await;
+            if let (Some(cur), Some(pv)) = (curr_decode, *prev) {
+                if cur.dt_count > pv.dt_count {
+                    let dtok = cur.gen_sum - pv.gen_sum;
+                    let dsec = cur.dt_sum - pv.dt_sum;
+                    if dsec > 0.0 && dtok >= 0.0 {
+                        *last = Some(dtok / dsec);
+                    }
+                }
+            }
+            if curr_decode.is_some() {
+                *prev = curr_decode;
+            }
+            *last
         };
 
         // --- New metrics ---
@@ -878,18 +1014,11 @@ impl EngineAdapter for VllmAdapter {
             total_requests,
             e2e_latency_ms: if blank { None } else { e2e_latency_ms },
             e2e_observations: if blank { None } else { e2e_observations },
-            prompt_tokens_per_sec: if blank { None } else { prompt_tokens_per_sec },
-            prompt_tokens_per_sec_interval_ms: if blank {
-                None
-            } else {
-                prompt_tokens_per_sec_interval_ms
-            },
-            avg_prompt_tokens_per_sec: if blank {
-                None
-            } else {
-                avg_prompt_tokens_per_sec
-            },
-            per_request_prompt_tps: if blank { None } else { per_request_prompt_tps },
+            last_req_pp: if blank { None } else { last_req_pp },
+            pp_5min: if blank { None } else { pp_5min },
+            pp_lifetime: if blank { None } else { pp_lifetime },
+            pure_prefill_tokens: if blank { None } else { pure_prefill_tokens },
+            last_req_tg: if blank { None } else { last_req_tg },
             swapped_requests,
             prefix_cache_hit_rate,
             queue_time_ms: if blank { None } else { queue_time_ms },
@@ -957,9 +1086,159 @@ fn spec_mean_acceptance_length(accepted: Option<f64>, drafts: Option<f64>) -> Op
     }
 }
 
+/// Pure-function core of the uncached-PP per-request derivation. Given a
+/// previous and current paired-histogram snapshot, returns the completion
+/// event to push into the ring (`Some((dtok, dsec))`) when one or more
+/// requests completed since the previous scrape and the deltas are physically
+/// plausible; returns `None` otherwise. Batched completions (n>1 in one
+/// scrape) fold into a single ring entry — its `dtok / dsec` is the batch
+/// mean, which is exactly the honest answer for the window.
+fn detect_pp_completion(prev: PrefillSample, cur: PrefillSample) -> Option<(f64, f64)> {
+    if cur.pt_count <= prev.pt_count {
+        return None;
+    }
+    let dtok = cur.pkc_sum - prev.pkc_sum;
+    let dsec = cur.pt_sum - prev.pt_sum;
+    if dsec > 0.0 && dtok >= 0.0 {
+        Some((dtok, dsec))
+    } else {
+        None
+    }
+}
+
+/// Lifetime uncached-PP rate: cumulative computed tokens over cumulative
+/// prefill seconds. `None` when the histogram has never observed a request.
+fn pp_lifetime_rate(s: PrefillSample) -> Option<f64> {
+    if s.pt_sum > 0.0 {
+        Some(s.pkc_sum / s.pt_sum)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recorded probe pair, 2026-08-29: one unique 56,031-token prompt, no
+    /// cache hit. Completion tick landed pkc_sum=56031, pt_sum=38.911, and
+    /// pt_count=1 in a single scrape. The derivation must recover the
+    /// probe-observed 1440 tok/s uncached prefill rate.
+    #[test]
+    fn detect_pp_completion_recovers_probe_rate() {
+        let prev = PrefillSample {
+            pkc_sum: 0.0,
+            pt_sum: 0.0,
+            pt_count: 0,
+        };
+        let cur = PrefillSample {
+            pkc_sum: 56031.0,
+            pt_sum: 38.911,
+            pt_count: 1,
+        };
+        let (dtok, dsec) = detect_pp_completion(prev, cur).expect("completion event");
+        let rate = dtok / dsec;
+        assert!(
+            (rate - 1440.0).abs() < 1.0,
+            "expected ~1440 tok/s from 56031 / 38.911, got {rate}"
+        );
+    }
+
+    /// Ring accumulation semantics: two completion events fold to
+    /// `Σdtok / Σdsec`, not a mean of ratios. Any batch of arbitrary sizes
+    /// must land at the token-weighted rate.
+    #[test]
+    fn ring_headline_is_token_weighted() {
+        let events = [(56031.0_f64, 38.911_f64), (10000.0_f64, 5.0_f64)];
+        let (t, s) = events
+            .iter()
+            .fold((0.0_f64, 0.0_f64), |(t, s), (dt, ds)| (t + dt, s + ds));
+        let rate = t / s;
+        // Σ=66031/43.911 ≈ 1503.7; NOT the arithmetic mean of 1440 and 2000.
+        assert!((rate - 1503.7).abs() < 1.0, "expected ~1503.7, got {rate}");
+    }
+
+    /// Batched completion (n>1 in one scrape) must fold to one ring entry
+    /// whose `dtok/dsec` equals the mean rate of the requests in the batch.
+    /// Correct because both histograms sum contributions across the batch
+    /// in the same scrape (probe-verified).
+    #[test]
+    fn detect_pp_completion_folds_batches_to_mean() {
+        let prev = PrefillSample {
+            pkc_sum: 1000.0,
+            pt_sum: 1.0,
+            pt_count: 5,
+        };
+        let cur = PrefillSample {
+            pkc_sum: 4000.0,
+            pt_sum: 3.0,
+            pt_count: 8,
+        };
+        let (dtok, dsec) = detect_pp_completion(prev, cur).expect("batch completion");
+        assert_eq!(dtok, 3000.0);
+        assert_eq!(dsec, 2.0);
+        assert!(((dtok / dsec) - 1500.0).abs() < f64::EPSILON);
+    }
+
+    /// No new completion (pt_count unchanged) yields no event even when the
+    /// sums appear to move (shouldn't happen in vLLM, but the guard keeps
+    /// spurious partial reads out of the ring).
+    #[test]
+    fn detect_pp_completion_needs_count_advance() {
+        let prev = PrefillSample {
+            pkc_sum: 100.0,
+            pt_sum: 0.1,
+            pt_count: 3,
+        };
+        let cur = PrefillSample {
+            pkc_sum: 200.0,
+            pt_sum: 0.2,
+            pt_count: 3,
+        };
+        assert!(detect_pp_completion(prev, cur).is_none());
+    }
+
+    /// Zero-duration event is rejected (protects against div-by-zero and
+    /// against reset-style transitions).
+    #[test]
+    fn detect_pp_completion_rejects_zero_duration() {
+        let prev = PrefillSample {
+            pkc_sum: 100.0,
+            pt_sum: 0.5,
+            pt_count: 1,
+        };
+        let cur = PrefillSample {
+            pkc_sum: 200.0,
+            pt_sum: 0.5,
+            pt_count: 2,
+        };
+        assert!(detect_pp_completion(prev, cur).is_none());
+    }
+
+    /// Lifetime sample from the plan: pkc_sum=288707, pt_sum=232.27
+    /// → 1243 tok/s. Anchors the lifetime cell against real hardware
+    /// numbers so a broken formula would surface immediately.
+    #[test]
+    fn pp_lifetime_rate_matches_plan_anchor() {
+        let s = PrefillSample {
+            pkc_sum: 288_707.0,
+            pt_sum: 232.27,
+            pt_count: 12,
+        };
+        let r = pp_lifetime_rate(s).expect("lifetime rate");
+        assert!((r - 1243.0).abs() < 1.0, "expected ~1243 tok/s, got {r}");
+    }
+
+    /// Empty-histogram guard: no observations means no lifetime rate.
+    #[test]
+    fn pp_lifetime_rate_none_when_no_observations() {
+        assert!(pp_lifetime_rate(PrefillSample {
+            pkc_sum: 0.0,
+            pt_sum: 0.0,
+            pt_count: 0,
+        })
+        .is_none());
+    }
 
     #[test]
     fn counter_rate_uses_elapsed_time_and_rejects_counter_resets() {

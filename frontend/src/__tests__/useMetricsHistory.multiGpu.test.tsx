@@ -127,8 +127,11 @@ describe('useMetricsHistory multi-GPU metrics', () => {
         metrics: {
           tokens_per_sec,
           tokens_per_sec_interval_ms: 1_000,
-          prompt_tokens_per_sec: tokens_per_sec * 10,
-          prompt_tokens_per_sec_interval_ms: 1_000,
+          last_req_pp: null,
+          pp_5min: null,
+          pp_lifetime: null,
+          pure_prefill_tokens: null,
+          last_req_tg: null,
         },
       } as unknown as MetricsSnapshot['engines'][number]],
     })

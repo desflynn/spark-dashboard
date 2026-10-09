@@ -79,10 +79,11 @@ function makeEngine(endpoint: string, name: string): EngineSnapshot {
       total_requests: 412,
       e2e_latency_ms: 4620,
       e2e_observations: 412,
-      prompt_tokens_per_sec: 41000,
-      prompt_tokens_per_sec_interval_ms: 1000,
-      avg_prompt_tokens_per_sec: 41000,
-      per_request_prompt_tps: 3180,
+      last_req_pp: null,
+      pp_5min: null,
+      pp_lifetime: null,
+      pure_prefill_tokens: null,
+      last_req_tg: null,
       swapped_requests: 0,
       prefix_cache_hit_rate: 64,
       queue_time_ms: 12,
@@ -279,9 +280,12 @@ describe('Fleet Dashboard', () => {
     engine.metrics = {
       ...engine.metrics!,
       tokens_per_sec: null,
-      prompt_tokens_per_sec: null,
+      last_req_pp: null,
+      pp_5min: null,
+      pp_lifetime: null,
+      pure_prefill_tokens: null,
+      last_req_tg: null,
       per_request_tps: null,
-      per_request_prompt_tps: null,
       total_prompt_tokens: null,
       total_generation_tokens: null,
       active_requests: null,
@@ -368,7 +372,7 @@ describe('Fleet Dashboard', () => {
       />,
     )
 
-    expect(screen.getByText('Memory free').parentElement).toHaveTextContent('Telemetry unavailable')
+    expect(screen.getByText('Memory free').parentElement).toHaveTextContent('—')
     expect(screen.getByText('Unified memory').parentElement?.parentElement).toHaveTextContent('Telemetry unavailable')
   })
 
@@ -395,7 +399,9 @@ describe('Fleet Dashboard', () => {
     )
 
     expect(screen.getByText(/lifetime average · weighted across both models/)).toBeInTheDocument()
-    expect(screen.getByText('across running engine lifetimes')).toBeInTheDocument()
+    // The overlay Served cell renders the lifetime total without the old
+    // subline; the honest unknown is the em-dash, and model rows stay live.
+    expect(screen.getByText('Served').parentElement).toHaveTextContent('requests')
     expect(screen.getByRole('button', { name: /test-model-a/ })).toHaveTextContent(/0\.8\s*s/)
   })
 })

@@ -4,14 +4,17 @@ import { CoreHeatmap } from '@/components/charts/CoreHeatmap'
 import { StackedBar, type BarSegment } from '@/components/StackedBar'
 import { SloSettingsControl } from '@/components/engines/SloSettingsControl'
 import { AreaSparkline } from '@/components/charts/AreaSparkline'
+import { Sparkline } from '@/components/charts/Sparkline'
 import { aggregateEngines } from '@/lib/engineAggregate'
 import { engineKey, findEngineByKey, gpuIndexOf, snapshotGpus } from '@/lib/identity'
+import { engineDisplayOverride, orderEnginesForDisplay } from '@/lib/engineDisplay'
 import { formatCompactTokens, formatGiB, formatMhz, fmtInt } from '@/lib/format'
 import { THRESHOLDS } from '@/lib/theme'
 import { useSloSettings } from '@/hooks/useSloSettings'
 import {
   COOL,
   GOOD,
+  WARN,
   alpha,
   activeFleetWindowMean,
   activeWindowMean,
@@ -41,6 +44,8 @@ interface DashboardProps {
   metrics: MetricsSnapshot | null
   history: {
     getChartData: (metric: string) => DataPoint[]
+    getPpChart?: (engineKey?: string) => DataPoint[]
+    getPpGreyChart?: (engineKey?: string) => DataPoint[]
   }
   events: GpuEvent[]
   requests: InferenceRequest[]
@@ -59,9 +64,12 @@ function SummaryCell({
   children: React.ReactNode
 }) {
   return (
-    <div className="flex flex-col gap-[3px]" style={{ padding: '13px 17px' }}>
+    <div
+      className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1"
+      style={{ padding: '7px 17px', flex: '1 1 240px', minWidth: 0 }}
+    >
       <div
-        className="uppercase"
+        className="uppercase shrink-0"
         style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
       >
         {label}
@@ -91,19 +99,50 @@ function Foot({ label, value }: { label: string; value: React.ReactNode }) {
   )
 }
 
+interface FootCell {
+  label: string
+  value: string
+  unit?: string
+}
+
 interface ThroughputProps {
   badge: string
   badgeColor: string
   title: string
   sub: string
   big: string
-  now: string
-  perReq: string
-  total: string
+  bigSub?: string
+  feet: FootCell[]
   series: DataPoint[]
+  underlaySeries?: DataPoint[]
   color: string
   height: number
   nowMs: number
+  active?: boolean
+}
+
+function PulseDots({ color, on }: { color: string; on: boolean }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1"
+      aria-hidden="true"
+      style={{ opacity: on ? 1 : 0, transition: 'opacity 200ms' }}
+    >
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="animate-pulse"
+          style={{
+            width: 5,
+            height: 5,
+            borderRadius: '50%',
+            background: color,
+            animationDelay: `${i * 200}ms`,
+          }}
+        />
+      ))}
+    </span>
+  )
 }
 
 function ThroughputCard({
@@ -112,18 +151,20 @@ function ThroughputCard({
   title,
   sub,
   big,
-  now,
-  perReq,
-  total,
+  bigSub,
+  feet,
   series,
+  underlaySeries,
   color,
   height,
   nowMs,
+  active = false,
 }: ThroughputProps) {
   return (
     <div
       className="flex flex-col min-w-0 min-h-0"
       style={{
+        flex: '1 1 320px',
         background: '#101214',
         border: '1px solid #1d2226',
         borderRadius: '16px',
@@ -167,24 +208,37 @@ function ThroughputCard({
         </span>
         <div className="flex flex-col gap-0.5 pb-1.5">
           <div style={{ fontSize: '17px', color: '#8b949d' }}>tok/s</div>
-          <div style={{ fontSize: '11.5px', color: '#78828c' }}>5-min average</div>
+          <div
+            className="flex items-center gap-1.5"
+            style={{ fontSize: '11.5px', color: '#78828c' }}
+          >
+            <PulseDots color={color} on={active} />
+            <span>{bigSub ?? '5-min average'}</span>
+          </div>
         </div>
       </div>
 
       <div className="relative" style={{ height, margin: '0 -6px' }}>
-        <AreaSparkline data={series} color={color} height={height} nowMs={nowMs} />
+        <AreaSparkline
+          data={series}
+          underlay={underlaySeries}
+          color={color}
+          height={height}
+          nowMs={nowMs}
+        />
       </div>
 
       <div
         className="flex flex-wrap gap-4"
         style={{ borderTop: '1px solid #1d2226', paddingTop: '14px' }}
       >
-        <Foot label="Now" value={`${now} tok/s`} />
-        <Foot label="Per request" value={`${perReq} tok/s`} />
-        <Foot
-          label={badge === 'PP' ? 'Total read' : 'Total written'}
-          value={`${total} tok`}
-        />
+        {feet.map((f) => (
+          <Foot
+            key={f.label}
+            label={f.label}
+            value={f.unit ? `${f.value} ${f.unit}` : f.value}
+          />
+        ))}
       </div>
     </div>
   )
@@ -363,7 +417,7 @@ export function Dashboard({
 }: DashboardProps) {
   // Engines (empty when no snapshot yet). Computed before the early return so
   // the hook below can be called unconditionally.
-  const engines = metrics?.engines ?? []
+  const engines = orderEnginesForDisplay(metrics?.engines ?? [])
 
   // The effective engine for the current tab. A stale key (not present) falls
   // back to the All view.
@@ -398,61 +452,95 @@ export function Dashboard({
   const activeKey = !isAll && activeEngine ? engineKey(activeEngine) : ''
   const eng = (seriesName: string): DataPoint[] => readSeries(`${activeKey}:${seriesName}`)
 
-  // ---- Throughput (PP / TG): 5-min average from history ----
-  const ppMean = isAll
-    ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)), nowMs)
-    : activeWindowMean(eng('promptTps'), nowMs)
-  const tgMean = isAll
-    ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:tps`)), nowMs)
-    : activeWindowMean(eng('tps'), nowMs)
-
-  // Live (instantaneous) values from the snapshot, aggregated or per-engine.
-  const ppNow = isAll
-    ? aggregate.prompt_tokens_per_sec
-    : activeEngine?.metrics?.prompt_tokens_per_sec
-  const tgNow = isAll ? aggregate.tokens_per_sec : activeEngine?.metrics?.tokens_per_sec
-  const ppPerReq = isAll
-    ? aggregate.per_request_prompt_tps
-    : activeEngine?.metrics?.per_request_prompt_tps
-  const tgPerReq = isAll
-    ? aggregate.per_request_tps
-    : activeEngine?.metrics?.per_request_tps
+  // ---- Throughput ----
+  //
+  // PP: uncached prefill only. Every cell is a view of the same quantity —
+  // cache-miss tokens ÷ seconds spent prefilling them. `pp_5min` is the
+  // headline; `last_req_pp` is what the last completed request achieved
+  // (persists across idle); `pp_lifetime` folds all requests. Live-during-
+  // prefill is not exposed by this vLLM build so we do not fake it — the
+  // sparkline traces completion samples pushed onto the ring.
+  //
+  // TG: decode counter DOES tick per step in this build, so live tok/s is
+  // real and stays as the headline; `last_req_tg` adds a per-request view.
+  const ppMean = isAll ? aggregate.pp_5min : activeEngine?.metrics?.pp_5min
+  const ppLastReq = isAll ? aggregate.last_req_pp : activeEngine?.metrics?.last_req_pp
+  const ppLifetime = isAll ? aggregate.pp_lifetime : activeEngine?.metrics?.pp_lifetime
   const ppTotal = isAll
     ? aggregate.total_prompt_tokens
     : activeEngine?.metrics?.total_prompt_tokens
+  const ppPure = isAll
+    ? aggregate.pure_prefill_tokens
+    : activeEngine?.metrics?.pure_prefill_tokens
+
+  const tgMean = isAll
+    ? activeFleetWindowMean(running.map((e) => readSeries(`${engineKey(e)}:tps`)), nowMs)
+    : activeWindowMean(eng('tps'), nowMs)
+  const tgNow = isAll ? aggregate.tokens_per_sec : activeEngine?.metrics?.tokens_per_sec
+  const tgPerReq = isAll
+    ? aggregate.per_request_tps
+    : activeEngine?.metrics?.per_request_tps
+  const tgLastReq = isAll ? aggregate.last_req_tg : activeEngine?.metrics?.last_req_tg
   const tgTotal = isAll
     ? aggregate.total_generation_tokens
     : activeEngine?.metrics?.total_generation_tokens
 
-  const ppSeries = isAll
-    ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:promptTps`)))
-    : sumConcurrentSeries([eng('promptTps')])
-  const tgSeries = isAll
+  const ppSeries = history.getPpChart?.(isAll ? undefined : activeKey) ?? []
+  const ppGreySeries = history.getPpGreyChart?.(isAll ? undefined : activeKey) ?? []
+  // Decode `tokens_per_sec` reads jitter: polls that land between token
+  // bursts see 0 even during a live block. Rolling mean over 5 samples so
+  // the trace reads as "block of decode", and hard-drop to 0 only when the
+  // trailing 3 samples are ALL zero — that's the "actually stopped" signal.
+  const tgRaw = isAll
     ? sumConcurrentSeries(running.map((e) => readSeries(`${engineKey(e)}:tps`)))
     : sumConcurrentSeries([eng('tps')])
+  const tgSeries = tgRaw.map((p, i, arr) => {
+    const trailStart = Math.max(0, i - 2)
+    let allZero = true
+    for (let j = trailStart; j <= i; j++) {
+      if (arr[j].value > 0) { allZero = false; break }
+    }
+    if (allZero) return { ...p, value: 0 }
+    const start = Math.max(0, i - 4)
+    let sum = 0
+    let n = 0
+    for (let j = start; j <= i; j++) {
+      sum += arr[j].value
+      n++
+    }
+    return { ...p, value: sum / n }
+  })
 
   const throughput = {
     pp: {
       badge: 'PP',
       badgeColor: GOOD,
       title: 'Prompt processing',
-      sub: 'prefill · tokens read',
+      sub: 'uncached prefill · tokens/sec',
       big: fmtOptional(ppMean),
-      now: fmtOptional(ppNow),
-      perReq: fmtOptional(ppPerReq),
+      big_sub: '5-min average',
+      last_req: fmtOptional(ppLastReq),
+      lifetime: fmtOptional(ppLifetime),
       total: ppTotal == null ? '—' : formatCompactTokens(ppTotal),
+      total_label: 'Total (incl. cache)',
+      total2: ppPure == null ? '—' : formatCompactTokens(ppPure),
+      total2_label: 'Pure prefill',
       series: ppSeries,
+      underlaySeries: ppGreySeries,
       color: GOOD,
     },
     tg: {
       badge: 'TG',
       badgeColor: COOL,
       title: 'Token generation',
-      sub: 'decode · tokens written',
+      sub: 'decode · tokens/sec',
       big: fmtOptional(tgMean),
+      big_sub: '5-min average',
       now: fmtOptional(tgNow),
-      perReq: fmtOptional(tgPerReq),
+      per_req: fmtOptional(tgPerReq),
+      last_req: fmtOptional(tgLastReq),
       total: tgTotal == null ? '—' : formatCompactTokens(tgTotal),
+      total_label: 'Total written',
       series: tgSeries,
       color: COOL,
     },
@@ -465,13 +553,6 @@ export function Dashboard({
   const freeGB = availBytes / GIB
   const totalGB = displayTotalBytes / GIB
   const memColor = memoryAvailable ? memFreeColor(freeGB) : '#8b949d'
-  const memStatus = !memoryAvailable
-    ? 'Telemetry unavailable'
-    : freeGB < 8
-      ? 'Critical — no headroom'
-      : freeGB < 24
-        ? `Tight — ${Math.round((freeGB / totalGB) * 100)}% headroom`
-        : 'Comfortable'
 
   const gpuTemp = boxGpu.temperature_celsius
   const gpuPower = boxGpu.power_watts
@@ -631,7 +712,6 @@ export function Dashboard({
               {memoryAvailable ? `GB of ${fmtInt(totalGB)}` : 'GB'}
             </span>
           </div>
-          <div style={{ fontSize: '11.5px', color: memColor }}>{memStatus}</div>
         </SummaryCell>
 
         <SummaryCell label="GPU temp">
@@ -682,13 +762,10 @@ export function Dashboard({
             </span>
             <span style={{ fontSize: '12.5px', color: '#8b949d' }}>requests</span>
           </div>
-          <div style={{ fontSize: '11.5px', color: '#8b949d' }}>
-            {isAll ? 'across running engine lifetimes' : 'this engine lifetime'}
-          </div>
         </SummaryCell>
       </div>
 
-      {/* ── Throughput pair ── */}
+      {/* ── Throughput + Cache ── */}
       <div className="flex flex-wrap gap-[clamp(10px,1vw,14px)]">
         <ThroughputCard
           badge={throughput.pp.badge}
@@ -696,13 +773,19 @@ export function Dashboard({
           title={throughput.pp.title}
           sub={throughput.pp.sub}
           big={throughput.pp.big}
-          now={throughput.pp.now}
-          perReq={throughput.pp.perReq}
-          total={throughput.pp.total}
+          bigSub={throughput.pp.big_sub}
+          feet={[
+            { label: 'Last Req', value: throughput.pp.last_req, unit: 'tok/s' },
+            { label: 'Lifetime', value: throughput.pp.lifetime, unit: 'tok/s' },
+            { label: throughput.pp.total_label, value: throughput.pp.total, unit: 'tok' },
+            { label: throughput.pp.total2_label, value: throughput.pp.total2, unit: 'tok' },
+          ]}
           series={throughput.pp.series}
+          underlaySeries={throughput.pp.underlaySeries}
           color={throughput.pp.color}
           height={76}
           nowMs={nowMs}
+          active={(activeSum ?? 0) > 0 && (tgNow ?? 0) < 1}
         />
         <ThroughputCard
           badge={throughput.tg.badge}
@@ -710,14 +793,213 @@ export function Dashboard({
           title={throughput.tg.title}
           sub={throughput.tg.sub}
           big={throughput.tg.big}
-          now={throughput.tg.now}
-          perReq={throughput.tg.perReq}
-          total={throughput.tg.total}
+          bigSub={throughput.tg.big_sub}
+          feet={[
+            { label: 'Now', value: throughput.tg.now, unit: 'tok/s' },
+            { label: 'Last Req', value: throughput.tg.last_req, unit: 'tok/s' },
+            { label: 'Per request', value: throughput.tg.per_req, unit: 'tok/s' },
+            { label: throughput.tg.total_label, value: throughput.tg.total, unit: 'tok' },
+          ]}
           series={throughput.tg.series}
           color={throughput.tg.color}
           height={76}
           nowMs={nowMs}
         />
+
+        {/* Cache */}
+        <div
+          className="flex flex-col min-w-0 min-h-0"
+          style={{
+            flex: '1 1 300px',
+            background: '#101214',
+            border: '1px solid #1d2226',
+            borderRadius: '16px',
+            padding: 'clamp(16px, 1.4vw, 22px)',
+            gap: '16px',
+          }}
+        >
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <span style={{ fontSize: '14px', fontWeight: 600 }}>Cache</span>
+            <span style={{ fontSize: '11.5px', color: '#78828c' }}>reuse over recompute</span>
+          </div>
+
+          <div className="flex items-center gap-[clamp(14px,1.6vw,22px)] flex-wrap">
+            <div className="relative shrink-0" style={{ width: '138px', height: '138px' }}>
+              <ArcGauge value={prefixHit ?? undefined} label="Prefix hit" unit="%" size={138} hideCenter />
+              <div
+                className="absolute inset-0 flex flex-col items-center justify-center"
+                style={{ gap: '1px' }}
+              >
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: '38px', fontWeight: 600, letterSpacing: '-0.03em' }}
+                >
+                  {prefixHit == null ? '—' : fmtInt(prefixHit)}
+                  <span style={{ fontSize: '17px', color: '#8b949d' }}>%</span>
+                </span>
+                <div
+                  className="uppercase"
+                  style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.1em', color: '#8b949d' }}
+                >
+                  Prefix hit
+                </div>
+              </div>
+            </div>
+
+            <div className="flex-1 min-w-0 min-h-0 flex flex-col gap-3">
+              <div className="flex flex-col gap-0.5">
+                <div
+                  className="uppercase"
+                  style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+                >
+                  Prefix lookups
+                </div>
+                <span
+                  className="font-mono tabular-nums"
+                  style={{ fontSize: '19px', fontWeight: 500, color: '#e7eaed' }}
+                >
+                  {prefixQueries == null ? '—' : formatCompactTokens(prefixQueries)}
+                </span>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <div className="flex justify-between items-baseline gap-2">
+                  <div
+                    className="uppercase"
+                    style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+                  >
+                    KV cache used
+                  </div>
+                  <span className="font-mono tabular-nums" style={{ fontSize: '13px', fontWeight: 500 }}>
+                    {kvCache == null ? '—' : fmtInt(kvCache)}%
+                  </span>
+                </div>
+                <div className="relative h-1 rounded overflow-hidden" style={{ background: '#20252a' }}>
+                  <div
+                    className="absolute inset-y-0 left-0"
+                    style={{ width: `${kvCache ?? 0}%`, background: COOL, borderRadius: '2px' }}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {showSpec && (
+            <div
+              className="flex flex-col"
+              style={{ borderTop: '1px solid #1d2226', paddingTop: '13px', gap: '9px' }}
+            >
+              <div
+                className="uppercase"
+                style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
+              >
+                Speculative decoding
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <div className="flex flex-col gap-0.5">
+                  <span
+                    className="font-mono tabular-nums"
+                    style={{ fontSize: '18px', fontWeight: 500, color: tarColor(specTar ?? 0) }}
+                  >
+                    {fmtInt(specTar ?? 0)}%
+                  </span>
+                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>drafts accepted</span>
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  <span className="font-mono tabular-nums" style={{ fontSize: '18px', fontWeight: 500 }}>
+                    {Number(specAcceptLen ?? 0).toFixed(2)}
+                  </span>
+                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>tok per draft</span>
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  <span className="font-mono tabular-nums" style={{ fontSize: '18px', fontWeight: 500 }}>
+                    {formatCompactTokens(specAccepted ?? 0)}
+                    <span style={{ fontSize: '12px', color: '#8b949d' }}>
+                      {' / '}
+                      {formatCompactTokens(specDraft ?? 0)}
+                    </span>
+                  </span>
+                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>accepted of drafted</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Requests strip (Active / Queued / Total) ── */}
+      <div
+        className="flex flex-wrap items-center gap-[clamp(12px,1.4vw,18px)]"
+        style={{
+          background: '#101214',
+          border: '1px solid #1d2226',
+          borderRadius: '16px',
+          padding: 'clamp(12px, 1.2vw, 18px)',
+        }}
+      >
+        <div className="flex items-center gap-2.5 shrink-0">
+          <span
+            className="inline-block shrink-0"
+            style={{
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: '11px',
+              fontWeight: 600,
+              color: WARN,
+              background: alpha(WARN, 0.13),
+              borderRadius: '5px',
+              padding: '3px 7px',
+            }}
+          >
+            REQ
+          </span>
+          <span style={{ fontSize: '14px', fontWeight: 600 }}>Requests</span>
+          <span style={{ fontSize: '11.5px', color: '#78828c' }}>active · queued · completed</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-[clamp(10px,1.2vw,16px)]" style={{ marginLeft: 'auto' }}>
+          <Foot
+            label="Active"
+            value={fmtInt((isAll ? aggregate.active_requests : activeEngine?.metrics?.active_requests) ?? null)}
+          />
+          <Foot
+            label="Queued"
+            value={fmtInt((isAll ? aggregate.queued_requests : activeEngine?.metrics?.queued_requests) ?? null)}
+          />
+          <Foot
+            label="Total"
+            value={fmtInt((isAll ? aggregate.total_requests : activeEngine?.metrics?.total_requests) ?? null)}
+          />
+          <Sparkline
+            width={180}
+            height={44}
+            series={[
+              {
+                data: sumConcurrentSeries(
+                  isAll
+                    ? running.map((e) => readSeries(`${engineKey(e)}:totalRequests`))
+                    : [eng('totalRequests')],
+                ).map((p) => p.value),
+                color: '#8b949d',
+              },
+              {
+                data: sumConcurrentSeries(
+                  isAll
+                    ? running.map((e) => readSeries(`${engineKey(e)}:queuedRequests`))
+                    : [eng('queuedRequests')],
+                ).map((p) => p.value),
+                color: WARN,
+              },
+              {
+                // Active last: later series paint on top, and green must stay
+                // visible where it overlaps the others at the floor.
+                data: sumConcurrentSeries(
+                  isAll
+                    ? running.map((e) => readSeries(`${engineKey(e)}:activeRequests`))
+                    : [eng('activeRequests')],
+                ).map((p) => p.value),
+                color: GOOD,
+              },
+            ]}
+          />
+        </div>
       </div>
 
       {/* ── Per model (All tab only) ── */}
@@ -775,7 +1057,7 @@ export function Dashboard({
               return (
                 <ModelRow
                   key={key}
-                  name={engine.model?.name ?? key}
+                  name={engineDisplayOverride(engine) ?? engine.model?.name ?? key}
                   meta={metaParts.join(' · ')}
                   pp={fmtOptional(ppMeanE)}
                   tg={fmtOptional(tgMeanE)}
@@ -795,7 +1077,7 @@ export function Dashboard({
         </div>
       )}
 
-      {/* ── Latency (2fr) + Cache (1fr) ── */}
+      {/* ── Latency ── */}
       <div className="flex flex-wrap gap-[clamp(10px,1vw,14px)]">
         {/* Latency */}
         <div
@@ -938,124 +1220,6 @@ export function Dashboard({
           </div>
         </div>
 
-        {/* Cache */}
-        <div
-          className="flex flex-col min-w-0 min-h-0"
-          style={{
-            flex: '1 1 300px',
-            background: '#101214',
-            border: '1px solid #1d2226',
-            borderRadius: '16px',
-            padding: 'clamp(16px, 1.4vw, 22px)',
-            gap: '16px',
-          }}
-        >
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <span style={{ fontSize: '14px', fontWeight: 600 }}>Cache</span>
-            <span style={{ fontSize: '11.5px', color: '#78828c' }}>reuse over recompute</span>
-          </div>
-
-          <div className="flex items-center gap-[clamp(14px,1.6vw,22px)] flex-wrap">
-            <div className="relative shrink-0" style={{ width: '138px', height: '138px' }}>
-              <ArcGauge value={prefixHit ?? undefined} label="Prefix hit" unit="%" size={138} hideCenter />
-              <div
-                className="absolute inset-0 flex flex-col items-center justify-center"
-                style={{ gap: '1px' }}
-              >
-                <span
-                  className="font-mono tabular-nums"
-                  style={{ fontSize: '38px', fontWeight: 600, letterSpacing: '-0.03em' }}
-                >
-                  {prefixHit == null ? '—' : fmtInt(prefixHit)}
-                  <span style={{ fontSize: '17px', color: '#8b949d' }}>%</span>
-                </span>
-                <div
-                  className="uppercase"
-                  style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.1em', color: '#8b949d' }}
-                >
-                  Prefix hit
-                </div>
-              </div>
-            </div>
-
-            <div className="flex-1 min-w-0 min-h-0 flex flex-col gap-3">
-              <div className="flex flex-col gap-0.5">
-                <div
-                  className="uppercase"
-                  style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
-                >
-                  Prefix lookups
-                </div>
-                <span
-                  className="font-mono tabular-nums"
-                  style={{ fontSize: '19px', fontWeight: 500, color: '#e7eaed' }}
-                >
-                  {prefixQueries == null ? '—' : formatCompactTokens(prefixQueries)}
-                </span>
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <div className="flex justify-between items-baseline gap-2">
-                  <div
-                    className="uppercase"
-                    style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
-                  >
-                    KV cache used
-                  </div>
-                  <span className="font-mono tabular-nums" style={{ fontSize: '13px', fontWeight: 500 }}>
-                    {kvCache == null ? '—' : fmtInt(kvCache)}%
-                  </span>
-                </div>
-                <div className="relative h-1 rounded overflow-hidden" style={{ background: '#20252a' }}>
-                  <div
-                    className="absolute inset-y-0 left-0"
-                    style={{ width: `${kvCache ?? 0}%`, background: COOL, borderRadius: '2px' }}
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {showSpec && (
-            <div
-              className="flex flex-col"
-              style={{ borderTop: '1px solid #1d2226', paddingTop: '13px', gap: '9px' }}
-            >
-              <div
-                className="uppercase"
-                style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '.11em', color: '#8b949d' }}
-              >
-                Speculative decoding
-              </div>
-              <div className="flex flex-wrap gap-3">
-                <div className="flex flex-col gap-0.5">
-                  <span
-                    className="font-mono tabular-nums"
-                    style={{ fontSize: '18px', fontWeight: 500, color: tarColor(specTar ?? 0) }}
-                  >
-                    {fmtInt(specTar ?? 0)}%
-                  </span>
-                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>drafts accepted</span>
-                </div>
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-mono tabular-nums" style={{ fontSize: '18px', fontWeight: 500 }}>
-                    {Number(specAcceptLen ?? 0).toFixed(2)}
-                  </span>
-                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>tok per draft</span>
-                </div>
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-mono tabular-nums" style={{ fontSize: '18px', fontWeight: 500 }}>
-                    {formatCompactTokens(specAccepted ?? 0)}
-                    <span style={{ fontSize: '12px', color: '#8b949d' }}>
-                      {' / '}
-                      {formatCompactTokens(specDraft ?? 0)}
-                    </span>
-                  </span>
-                  <span style={{ fontSize: '11.5px', color: '#78828c' }}>accepted of drafted</span>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
       </div>
 
       {/* ── THE BOX divider ── */}

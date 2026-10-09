@@ -31,9 +31,10 @@ export function GlobalEngineCard({ snapshot, latencyMode = 'avg' }: GlobalEngine
     tokens_per_sec,
     avg_tokens_per_sec,
     per_request_tps,
-    prompt_tokens_per_sec,
-    avg_prompt_tokens_per_sec,
-    per_request_prompt_tps,
+    last_req_pp,
+    pp_5min,
+    pp_lifetime,
+    pure_prefill_tokens,
     ttft_ms,
     e2e_latency_ms,
     queue_time_ms,
@@ -95,9 +96,10 @@ export function GlobalEngineCard({ snapshot, latencyMode = 'avg' }: GlobalEngine
             <span className="ml-1 text-[9px] font-normal text-zinc-500">(sum)</span>
           </div>
           <div className="grid grid-cols-1 gap-1.5">
-            <LiveWithTotal liveValue={fmtVal(prompt_tokens_per_sec, formatTps)} liveUnit="tok/s" totalLabel="Processed" total={total_prompt_tokens} />
-            <MetricTile label="Avg" value={fmtVal(avg_prompt_tokens_per_sec, formatTps)} unit="tok/s" />
-            <MetricTile label="Per-Req Avg" value={fmtVal(per_request_prompt_tps, formatTps)} unit="tok/s" />
+            <LiveWithTotal liveValue={fmtVal(last_req_pp, formatTps)} liveUnit="tok/s" totalLabel="Total (incl. cache)" total={total_prompt_tokens} />
+            <MetricTile label="5-min" value={fmtVal(pp_5min, formatTps)} unit="tok/s" />
+            <MetricTile label="Lifetime" value={fmtVal(pp_lifetime, formatTps)} unit="tok/s" />
+            <MetricTile label="Pure prefill" value={pure_prefill_tokens == null ? '—' : formatCompactTokens(pure_prefill_tokens)} unit="tok" />
           </div>
         </div>
 

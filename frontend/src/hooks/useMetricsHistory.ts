@@ -10,6 +10,28 @@ interface DataPoint {
 }
 
 const BUFFER_CAPACITY = 900 // 15 minutes at 1 sample/sec
+
+/** Rect points for a [start, end] window at `rate`. Interior points every 2s
+ *  keep consecutive gaps under AreaSparkline's 2.5s segment-break threshold —
+ *  without them a wide block renders as two disconnected vertical edges (no
+ *  top, no fill). */
+function emitRect(
+  pts: { timestamp: number; value: number }[],
+  start_ms: number,
+  end_ms: number,
+  rate: number,
+  cutoff: number,
+) {
+  const s = Math.max(start_ms, cutoff)
+  pts.push({ timestamp: s - 1, value: 0 })
+  pts.push({ timestamp: s, value: rate })
+  for (let t = s + 2000; t < end_ms; t += 2000) {
+    pts.push({ timestamp: t, value: rate })
+  }
+  pts.push({ timestamp: end_ms, value: rate })
+  pts.push({ timestamp: end_ms + 1, value: 0 })
+}
+
 const EVENT_BUFFER_CAPACITY = 100
 const REQUEST_BUFFER_CAPACITY = 50
 
@@ -98,6 +120,32 @@ export function useMetricsHistory(
     Record<string, Record<string, CircularBuffer<DataPoint>>>
   >({})
   const lastEngineTimestampRef = useRef<Record<string, number>>({})
+  const lastPurePrefillRef = useRef<Record<string, { tokens: number; ts: number }>>({})
+  // Completed-prefill events per engine, materialized into sparkline pulses
+  // in `getPpChart`. Backend has no per-request stream, so we reconstruct the
+  // pulse from `pure_prefill_tokens` deltas + `last_req_pp`:
+  //   duration = dtok / rate,  start = end - duration.
+  const ppEventsRef = useRef<
+    Record<string, CircularBuffer<{ start_ms: number; end_ms: number; rate: number }>>
+  >({})
+  // Grey "prefill working" windows. Raised when the engine leaves idle
+  // (active_requests 0→N) or when a completion record lands while another
+  // request is already running (back-to-back — running never dips to zero).
+  // Height is frozen at the 5-min PP average; the window drops at the first
+  // generation movement (prefill done, TTFT gap included), when the completion
+  // record lands with no generation ever seen (zero-output fallback), or when
+  // active_requests falls back to zero (aborted request). Materialized as
+  // grey rectangles by `getPpGreyChart`, including the still-open window.
+  const ppWorkingRef = useRef<Record<string, { startTs: number; height: number } | null>>({})
+  const greyEventsRef = useRef<
+    Record<string, CircularBuffer<{ start_ms: number; end_ms: number; rate: number }>>
+  >({})
+  const lastActiveRef = useRef<Record<string, number>>({})
+  const lastCompletionRef = useRef<Record<string, number>>({})
+  const genSinceCompletionRef = useRef<Record<string, boolean>>({})
+  // Closed grey windows awaiting their completion record: the green block
+  // backfills exactly this [grey start → PP end] window and deletes the grey.
+  const pendingRef = useRef<Record<string, { startTs: number; endTs: number } | null>>({})
   const eventBufferRef = useRef(
     new CircularBuffer<GpuEventData>(EVENT_BUFFER_CAPACITY),
   )
@@ -153,9 +201,11 @@ export function useMetricsHistory(
           prefixCacheHit: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           e2eLatency: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           e2eObservations: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
-          promptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
-          avgPromptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
-          perReqPromptTps: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          ppLastReq: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          ppInstant: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          pp5min: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          ppLifetime: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
+          tgLastReq: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           queueTime: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           interTokenLatency: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
           itlObservations: new CircularBuffer<DataPoint>(BUFFER_CAPACITY),
@@ -218,18 +268,134 @@ export function useMetricsHistory(
         if (engine.metrics.e2e_observations !== null) {
           eb.e2eObservations.push({ timestamp: engineTs, value: engine.metrics.e2e_observations })
         }
-        if (engine.metrics.prompt_tokens_per_sec !== null) {
-          eb.promptTps.push({
-            timestamp: engineTs,
-            value: engine.metrics.prompt_tokens_per_sec,
-            durationMs: engine.metrics.prompt_tokens_per_sec_interval_ms ?? 0,
-          })
+        if (engine.metrics.last_req_pp !== null) {
+          eb.ppLastReq.push({ timestamp: engineTs, value: engine.metrics.last_req_pp })
         }
-        if (engine.metrics.avg_prompt_tokens_per_sec !== null) {
-          eb.avgPromptTps.push({ timestamp: engineTs, value: engine.metrics.avg_prompt_tokens_per_sec })
+        // Prefill pulse reconstruction.
+        //  - Poll-interval rate → `ppInstant` (zero when idle). Used by the
+        //    old sparkline path and by anything that wants a per-poll trace.
+        //  - True [start, end] rectangle → `ppEvents`, materialised into the
+        //    sparkline by `getPpChart`. Duration = dtok / last_req_pp so the
+        //    pulse reflects how long the prefill actually ran, not just the
+        //    one poll where the counter jumped. The completion record lands
+        //    in the poll after the prefill ends, so the rectangle is anchored
+        //    at end = poll time and reaches back the full true duration.
+        let completedThisPoll = false
+        let completion: { dtok: number; trueRate: number } | null = null
+        if (engine.metrics.pure_prefill_tokens !== null) {
+          const cur = engine.metrics.pure_prefill_tokens
+          const prev = lastPurePrefillRef.current[key]
+          if (prev && engineTs > prev.ts) {
+            const dtok = cur - prev.tokens
+            const dsec = (engineTs - prev.ts) / 1000
+            const rate = dtok > 0 && dsec > 0 ? dtok / dsec : 0
+            eb.ppInstant.push({ timestamp: engineTs, value: rate })
+            if (dtok > 0) {
+              completedThisPoll = true
+              completion = { dtok, trueRate: engine.metrics.last_req_pp ?? 0 }
+            }
+          }
+          lastPurePrefillRef.current[key] = { tokens: cur, ts: engineTs }
         }
-        if (engine.metrics.per_request_prompt_tps !== null) {
-          eb.perReqPromptTps.push({ timestamp: engineTs, value: engine.metrics.per_request_prompt_tps })
+        // Grey "working" latch — see ppWorkingRef for the state machine.
+        // ponytail: concurrent decode + prefill closes the grey window early
+        // (genMoved is engine-wide, not per-request); per-request lanes only
+        // if overlapping requests become the norm.
+        if (engine.metrics.active_requests !== null) {
+          const active = engine.metrics.active_requests
+          const prevActive = lastActiveRef.current[key] ?? 0
+          lastActiveRef.current[key] = active
+          const tpsNow = engine.metrics.tokens_per_sec ?? 0
+          if (completedThisPoll) {
+            lastCompletionRef.current[key] = engineTs
+            genSinceCompletionRef.current[key] = false
+          }
+          if (tpsNow > 0) genSinceCompletionRef.current[key] = true
+          const working = ppWorkingRef.current[key] ?? null
+          if (working && (tpsNow > 0 || completedThisPoll || (active === 0 && prevActive > 0))) {
+            if (engineTs > working.startTs) {
+              if (!greyEventsRef.current[key]) {
+                greyEventsRef.current[key] = new CircularBuffer(200)
+              }
+              greyEventsRef.current[key].push({
+                start_ms: working.startTs,
+                end_ms: engineTs,
+                rate: working.height,
+              })
+              // Keep the observed window so the green block that replaces
+              // this grey lands exactly on [grey start → PP end].
+              pendingRef.current[key] = { startTs: working.startTs, endTs: engineTs }
+            }
+            ppWorkingRef.current[key] = null
+          }
+          // Backfill: the completion record replaces the grey placeholder with
+          // the true prefill block — same window the grey covered, height =
+          // engine-reported prefill rate — and deletes the grey it covered.
+          const pending = pendingRef.current[key] ?? null
+          if (completedThisPoll && pending) {
+            pendingRef.current[key] = null
+            if (completion && completion.trueRate > 0) {
+              if (!ppEventsRef.current[key]) {
+                ppEventsRef.current[key] = new CircularBuffer(200)
+              }
+              ppEventsRef.current[key].push({
+                start_ms: pending.startTs,
+                end_ms: pending.endTs,
+                rate: completion.trueRate,
+              })
+              const buf = greyEventsRef.current[key]
+              if (buf) {
+                const all = buf.toArray()
+                const kept = all.filter(
+                  (g) => g.end_ms <= pending.startTs || g.start_ms >= pending.endTs,
+                )
+                if (kept.length !== all.length) {
+                  buf.clear()
+                  for (const g of kept) buf.push(g)
+                }
+              }
+            }
+          } else if (completedThisPoll && completion && completion.trueRate > 0) {
+            // No pending window (request arrived and completed without an
+            // observed working phase): reconstruct from duration.
+            if (!ppEventsRef.current[key]) {
+              ppEventsRef.current[key] = new CircularBuffer(200)
+            }
+            const durationMs = (completion.dtok / completion.trueRate) * 1000
+            ppEventsRef.current[key].push({
+              start_ms: engineTs - durationMs,
+              end_ms: engineTs,
+              rate: completion.trueRate,
+            })
+          }
+          // Chained entry: a completion recently landed while another request
+          // is already running. Deferred one poll and gated on "no generation
+          // has flowed since that completion" — the request still running at
+          // the completion poll may be the completed one itself mid-decode,
+          // which must not raise grey.
+          const completionTs = lastCompletionRef.current[key]
+          const chainedEntry = completionTs !== undefined
+            && engineTs > completionTs
+            && engineTs - completionTs <= 5_000
+            && !(genSinceCompletionRef.current[key] ?? false)
+          if ((ppWorkingRef.current[key] ?? null) === null && active > 0 && tpsNow === 0) {
+            const idleEntry = prevActive === 0
+            if (idleEntry || chainedEntry) {
+              ppWorkingRef.current[key] = {
+                startTs: engineTs,
+                height: engine.metrics.pp_5min ?? engine.metrics.last_req_pp ?? 0,
+              }
+            }
+          }
+        }
+        if (engine.metrics.pp_5min !== null) {
+          eb.pp5min.push({ timestamp: engineTs, value: engine.metrics.pp_5min })
+        }
+        if (engine.metrics.pp_lifetime !== null) {
+          eb.ppLifetime.push({ timestamp: engineTs, value: engine.metrics.pp_lifetime })
+        }
+        if (engine.metrics.last_req_tg !== null) {
+          eb.tgLastReq.push({ timestamp: engineTs, value: engine.metrics.last_req_tg })
         }
         if (engine.metrics.queue_time_ms !== null) {
           eb.queueTime.push({ timestamp: engineTs, value: engine.metrics.queue_time_ms })
@@ -387,6 +553,60 @@ export function useMetricsHistory(
     [version],
   )
 
+  /** PP sparkline as pulses: 0 → rate → rate → 0 spanning each completed
+   *  prefill's [start, end] window. `key` narrows to one engine; omit for the
+   *  fleet (events are concatenated across engines — visually overlapping
+   *  rectangles, not a true concurrent sum). */
+  const getPpChart = useCallback(
+    (key?: string): DataPoint[] => {
+      void version
+      const windowMs = DEFAULT_WINDOW_SECONDS * 1000
+      const now = lastTimestampRef.current
+      const cutoff = now - windowMs
+      const keys = key ? [key] : Object.keys(ppEventsRef.current)
+      const pts: DataPoint[] = []
+      for (const k of keys) {
+        const buf = ppEventsRef.current[k]
+        if (!buf) continue
+        for (const e of buf.toArray()) {
+          if (e.end_ms < cutoff) continue
+          emitRect(pts, e.start_ms, e.end_ms, e.rate, cutoff)
+        }
+      }
+      pts.sort((a, b) => a.timestamp - b.timestamp)
+      return pts
+    },
+    [version],
+  )
+
+  /** Grey "working" rectangles for the PP sparkline: in-progress prefill
+   *  windows at the frozen 5-min-average height, plus the still-open window
+   *  drawn live up to `now`. `key` narrows to one engine; omit for the fleet. */
+  const getPpGreyChart = useCallback(
+    (key?: string): DataPoint[] => {
+      void version
+      const windowMs = DEFAULT_WINDOW_SECONDS * 1000
+      const now = lastTimestampRef.current
+      const cutoff = now - windowMs
+      const keys = key ? [key] : Object.keys(greyEventsRef.current)
+      const pts: DataPoint[] = []
+      for (const k of keys) {
+        const buf = greyEventsRef.current[k]
+        if (buf) {
+          for (const e of buf.toArray()) {
+            if (e.end_ms < cutoff) continue
+            emitRect(pts, e.start_ms, e.end_ms, e.rate, cutoff)
+          }
+        }
+        const open = ppWorkingRef.current[k]
+        if (open && now > open.startTs) emitRect(pts, open.startTs, now, open.height, cutoff)
+      }
+      pts.sort((a, b) => a.timestamp - b.timestamp)
+      return pts
+    },
+    [version],
+  )
+
   const getEvents = useCallback((): GpuEventData[] => {
     void version
 
@@ -429,5 +649,5 @@ export function useMetricsHistory(
     [version],
   )
 
-  return { getChartData, getSparklineData, getEvents, getRequests }
+  return { getChartData, getSparklineData, getPpChart, getPpGreyChart, getEvents, getRequests }
 }

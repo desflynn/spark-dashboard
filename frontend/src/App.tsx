@@ -6,6 +6,7 @@ import { ConfigurationNotices } from './components/ConfigurationNotices'
 import { Dashboard } from './components/views/Dashboard'
 import { LogViewer } from './components/LogViewer'
 import { engineKey, findEngineByKey } from './lib/identity'
+import { engineDisplayOverride, orderEnginesForDisplay } from './lib/engineDisplay'
 import type { EngineSnapshot } from './types/metrics'
 import type { GpuEvent, InferenceRequest } from './types/events'
 
@@ -31,6 +32,8 @@ function portFallback(endpoint: string): string {
 /** Label for a model tab chip: the model's short name, or its endpoint port
  *  when the engine has no model. */
 function chipLabel(engine: EngineSnapshot): string {
+  const override = engineDisplayOverride(engine)
+  if (override) return override
   const name = engine.model?.name
   if (name) return modelBaseName(name)
   return portFallback(engine.endpoint) || engine.endpoint
@@ -73,7 +76,7 @@ function App() {
 
   // Engine the console streams: follows the active tab, undefined on All.
   // Derived (not stored) so the header and the log viewer can never disagree.
-  const engines = metrics?.engines ?? []
+  const engines = useMemo(() => orderEnginesForDisplay(metrics?.engines ?? []), [metrics?.engines])
   const selectedEngineEndpoint =
     activeTab === 'all' ? undefined : findEngineByKey(engines, activeTab)?.endpoint
 

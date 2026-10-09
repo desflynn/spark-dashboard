@@ -20,6 +20,7 @@ import {
 import { aggregateEngines, groupRunningByProvider } from '@/lib/engineAggregate'
 import { engineDisplayName, formatGpuIndexes } from '@/lib/format'
 import { engineKey, findEngineByKey } from '@/lib/identity'
+import { engineDisplayOverride, orderEnginesForDisplay } from '@/lib/engineDisplay'
 import { getProviderLogo } from '@/lib/providerLogo'
 import { useTabRotation } from '@/hooks/useTabRotation'
 import type { EngineSnapshot, EngineType, DeploymentMode } from '@/types/metrics'
@@ -93,9 +94,10 @@ interface EngineChartData {
   kv: ChartDataPoint[]
   prefixCacheHit: ChartDataPoint[]
   e2eLatency: ChartDataPoint[]
-  promptTps: ChartDataPoint[]
-  avgPromptTps: ChartDataPoint[]
-  perReqPromptTps: ChartDataPoint[]
+  ppLastReq: ChartDataPoint[]
+  pp5min: ChartDataPoint[]
+  ppLifetime: ChartDataPoint[]
+  tgLastReq: ChartDataPoint[]
   queueTime: ChartDataPoint[]
   interTokenLatency: ChartDataPoint[]
   batchSize: ChartDataPoint[]
@@ -134,7 +136,7 @@ interface EngineSectionProps {
 }
 
 export function EngineSection({
-  engines,
+  engines: incomingEngines,
   showCharts = false,
   collapseCharts = false,
   getChartData,
@@ -143,6 +145,7 @@ export function EngineSection({
   onActiveEngineChange,
   onActiveEngineGpuChange,
 }: EngineSectionProps) {
+  const engines = useMemo(() => orderEnginesForDisplay(incomingEngines), [incomingEngines])
   const [activeTab, setActiveTab] = useState<string>(() => {
     if (typeof window === 'undefined') return GLOBAL_TAB_VALUE
     try {
@@ -332,7 +335,7 @@ export function EngineSection({
 
   const headerTitle = isGlobal
     ? 'All Engines'
-    : activeEngine?.model?.name ?? 'No Model Loaded'
+    : (activeEngine && engineDisplayOverride(activeEngine)) ?? activeEngine?.model?.name ?? 'No Model Loaded'
 
   const headerProviderLogo = !isGlobal ? getProviderLogo(activeEngine?.model?.name) : null
 
@@ -487,9 +490,10 @@ export function EngineSection({
                   kv: getChartData(`${key}:kvCache`),
                   prefixCacheHit: getChartData(`${key}:prefixCacheHit`),
                   e2eLatency: getChartData(`${key}:e2eLatency`),
-                  promptTps: getChartData(`${key}:promptTps`),
-                  avgPromptTps: getChartData(`${key}:avgPromptTps`),
-                  perReqPromptTps: getChartData(`${key}:perReqPromptTps`),
+                  ppLastReq: getChartData(`${key}:ppLastReq`),
+                  pp5min: getChartData(`${key}:pp5min`),
+                  ppLifetime: getChartData(`${key}:ppLifetime`),
+                  tgLastReq: getChartData(`${key}:tgLastReq`),
                   queueTime: getChartData(`${key}:queueTime`),
                   interTokenLatency: getChartData(`${key}:interTokenLatency`),
                   batchSize: getChartData(`${key}:batchSize`),

@@ -135,10 +135,20 @@ export interface EngineMetrics {
   // --- New metrics ---
   e2e_latency_ms: number | null
   e2e_observations: number | null
-  prompt_tokens_per_sec: number | null
-  prompt_tokens_per_sec_interval_ms: number | null
-  avg_prompt_tokens_per_sec: number | null
-  per_request_prompt_tps: number | null
+  /** Uncached prefill throughput (tok/s) for the most recently completed
+   *  request. Sourced from paired request_prefill histograms at completion.
+   *  Persists across idle so the "Last Req" card cell keeps a real value. */
+  last_req_pp: number | null
+  /** Uncached prefill throughput (tok/s) over the last 5 minutes, as
+   *  Σ Δtok / Σ Δsec across every request completed in the window.
+   *  `null` when the window is empty — the card shows `—`, never 0. */
+  pp_5min: number | null
+  /** Uncached prefill throughput (tok/s) over the engine's lifetime. */
+  pp_lifetime: number | null
+  /** Cumulative uncached (compute-path) prefill tokens since engine start. */
+  pure_prefill_tokens: number | null
+  /** Decode throughput (tok/s) for the most recently completed request. */
+  last_req_tg: number | null
   swapped_requests: number | null
   prefix_cache_hit_rate: number | null
   queue_time_ms: number | null
