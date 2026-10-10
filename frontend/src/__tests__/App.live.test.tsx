@@ -53,6 +53,7 @@ describe('App live status', () => {
 
   it('shows the deployed engines in display order without changing their identities', () => {
     const engines = [
+      engine(18316, '/checkpoint'),
       engine(18312, '/checkpoint'),
       engine(18314, null),
       engine(18300, '/home/des/scratch/seat0u-model'),
@@ -61,17 +62,17 @@ describe('App live status', () => {
     render(<App />)
     const header = screen.getByRole('banner')
     expect(within(header).getAllByRole('button').map((button) => button.textContent)).toEqual([
-      'All · 3', 'Qwen 3.8 0Z2', 'Ornith', 'Decider',
+      'All · 4', 'Qwen 3.8 0Z2', 'Qwen 3.8 27B', 'Ornith', 'Decider',
     ])
-    for (const name of ['Qwen 3.8 0Z2', 'Ornith', 'Decider']) {
+    for (const name of ['Qwen 3.8 0Z2', 'Qwen 3.8 27B', 'Ornith', 'Decider']) {
       fireEvent.click(within(header).getByRole('button', { name }))
       expect(within(header).getAllByText(name)).toHaveLength(2)
     }
     expect(engines.map((engine) => engine.endpoint)).toEqual([
-      'http://localhost:18312', 'http://localhost:18314', 'http://localhost:18300',
+      'http://localhost:18316', 'http://localhost:18312', 'http://localhost:18314', 'http://localhost:18300',
     ])
     expect(engines.map((engine) => engine.model?.name ?? null)).toEqual([
-      '/checkpoint', null, '/home/des/scratch/seat0u-model',
+      '/checkpoint', '/checkpoint', null, '/home/des/scratch/seat0u-model',
     ])
   })
 

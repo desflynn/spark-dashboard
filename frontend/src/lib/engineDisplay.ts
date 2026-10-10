@@ -4,6 +4,7 @@ import type { EngineSnapshot } from '@/types/metrics'
 // Array order is also the presentation order; endpoints remain engine identities.
 const DISPLAY_ENGINES = [
   { endpoint: 'http://localhost:18300', name: 'Qwen 3.8 0Z2' },
+  { endpoint: 'http://localhost:18316', name: 'Qwen 3.8 27B' },
   { endpoint: 'http://localhost:18312', name: 'Ornith' },
   { endpoint: 'http://localhost:18314', name: 'Decider' },
 ]
